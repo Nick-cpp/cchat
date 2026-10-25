@@ -12,7 +12,7 @@
  * The same key must be defined in client.c.  It is embedded in the source on
  * purpose, so it protects messages in transit but is not a secret.
  */
-#define CHAT_ENCRYPTION_KEY "cchat-embedded-key-2026-do-not-use-in-production"
+#define CHAT_ENCRYPTION_KEY "YourKey"
 #include "crypto.h"
 
 #define DEFAULT_PORT 8080
