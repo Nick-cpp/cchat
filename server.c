@@ -26,11 +26,10 @@
 #define USERS_FILE "users.txt"
 #define HISTORY_FILE "history.txt"
 #define CONFIG_FILE "host.conf"
+#define BANNED_FILE "banned.txt"
 
-#define RATE_LIMIT_MS 1000
+#define RATE_LIMIT_MS 2000
 #define SPAM_REPEAT_LIMIT 5
-#define BAN_DURATION_MS (60 * 1000)
-#define MAX_BANS 64
 
 int load_or_create_config() {
     FILE *f = fopen(CONFIG_FILE, "r");
@@ -59,72 +58,37 @@ unsigned long hash_password(const char *str) {
     return hash;
 }
 
-typedef struct {
-    char username[MAX_USER_LEN];
-    long long until_ms;
-} BanEntry;
-
-static BanEntry ban_list[MAX_BANS];
-static int ban_count = 0;
-
 static long long monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static void remove_expired_bans(long long now) {
-    for (int i = 0; i < ban_count; ) {
-        if (ban_list[i].until_ms <= now) {
-            ban_list[i] = ban_list[ban_count - 1];
-            ban_count--;
-        } else {
-            i++;
-        }
-    }
-}
-
 static int is_banned(const char *username) {
-    long long now = monotonic_ms();
-    remove_expired_bans(now);
+    FILE *f = fopen(BANNED_FILE, "r");
+    if (!f) return 0;
 
-    for (int i = 0; i < ban_count; i++) {
-        if (strcmp(ban_list[i].username, username) == 0) {
-            return 1;
+    char line[MAX_USER_LEN + 2];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, username) == 0) {
+            found = 1;
+            break;
         }
     }
-    return 0;
+    fclose(f);
+    return found;
 }
 
 static void ban_username(const char *username) {
-    long long now = monotonic_ms();
-    long long until = now + BAN_DURATION_MS;
-    remove_expired_bans(now);
+    if (is_banned(username)) return;
 
-    for (int i = 0; i < ban_count; i++) {
-        if (strcmp(ban_list[i].username, username) == 0) {
-            ban_list[i].until_ms = until;
-            return;
-        }
+    FILE *f = fopen(BANNED_FILE, "a");
+    if (f) {
+        fprintf(f, "%s\n", username);
+        fclose(f);
     }
-
-    int slot = ban_count;
-    if (ban_count < MAX_BANS) {
-        ban_count++;
-    } else {
-        slot = 0;
-        for (int i = 1; i < ban_count; i++) {
-            if (ban_list[i].until_ms < ban_list[slot].until_ms) {
-                slot = i;
-            }
-        }
-    }
-
-    memset(&ban_list[slot], 0, sizeof(ban_list[slot]));
-    size_t name_len = strlen(username);
-    if (name_len >= MAX_USER_LEN) name_len = MAX_USER_LEN - 1;
-    memcpy(ban_list[slot].username, username, name_len);
-    ban_list[slot].until_ms = until;
 }
 
 int handle_auth(int client_sock, char *out_username) {
@@ -255,7 +219,7 @@ int main() {
     size_t msg_len = 0;
     char client_usernames[MAX_CLIENTS][MAX_USER_LEN];
     char client_last_message[MAX_CLIENTS][BUFFER_SIZE];
-    long long client_last_message_ms[MAX_CLIENTS];
+    long long last_global_message_ms = -RATE_LIMIT_MS;
     int client_repeat_count[MAX_CLIENTS];
     int addrlen;
     struct sockaddr_in address;
@@ -266,7 +230,6 @@ int main() {
         client_sockets[i] = 0;
         memset(client_usernames[i], 0, MAX_USER_LEN);
         memset(client_last_message[i], 0, BUFFER_SIZE);
-        client_last_message_ms[i] = 0;
         client_repeat_count[i] = 0;
     }
 
@@ -322,6 +285,15 @@ int main() {
 
             if (handle_auth(new_socket, auth_user)) {
                 printf("Client %s successfully authorized!\n", auth_user);
+
+                long long elapsed = monotonic_ms() - last_global_message_ms;
+                if (elapsed < RATE_LIMIT_MS) {
+                    char cooldown_msg[64];
+                    snprintf(cooldown_msg, sizeof(cooldown_msg),
+                             "@COOLDOWN %lld\n", RATE_LIMIT_MS - elapsed);
+                    cchat_send_encrypted(new_socket, cooldown_msg, strlen(cooldown_msg));
+                }
+
                 send_history(new_socket);
 
                 char join_msg[BUFFER_SIZE];
@@ -341,7 +313,6 @@ int main() {
                         client_sockets[i] = new_socket;
                         strcpy(client_usernames[i], auth_user);
                         client_last_message[i][0] = '\0';
-                        client_last_message_ms[i] = 0;
                         client_repeat_count[i] = 0;
                         added = 1;
                         break;
@@ -381,7 +352,6 @@ int main() {
                     client_sockets[i] = 0;
                     memset(client_usernames[i], 0, MAX_USER_LEN);
                     client_last_message[i][0] = '\0';
-                    client_last_message_ms[i] = 0;
                     client_repeat_count[i] = 0;
                 } else {
                     buffer[msg_len] = '\0';
@@ -405,10 +375,9 @@ int main() {
 
                         char ban_msg[BUFFER_SIZE];
                         snprintf(ban_msg, sizeof(ban_msg),
-                                 "[Server]: You have been banned for %d seconds for spamming.\n",
-                                 BAN_DURATION_MS / 1000);
+                                 "[Server]: You have been permanently banned for spamming.\n");
                         cchat_send_encrypted(sd, ban_msg, strlen(ban_msg));
-                        printf("Client %s banned for spamming.\n", client_usernames[i]);
+                        printf("Client %s permanently banned for spamming.\n", client_usernames[i]);
 
                         char leave_msg[BUFFER_SIZE];
                         snprintf(leave_msg, sizeof(leave_msg),
@@ -426,22 +395,27 @@ int main() {
                         client_sockets[i] = 0;
                         memset(client_usernames[i], 0, MAX_USER_LEN);
                         client_last_message[i][0] = '\0';
-                        client_last_message_ms[i] = 0;
                         client_repeat_count[i] = 0;
                         continue;
                     }
 
-                    if (client_last_message_ms[i] != 0 &&
-                        now - client_last_message_ms[i] < RATE_LIMIT_MS) {
-                        char wait_msg[BUFFER_SIZE];
-                        long long wait_ms = RATE_LIMIT_MS - (now - client_last_message_ms[i]);
-                        snprintf(wait_msg, sizeof(wait_msg),
-                                 "[Server]: Please wait %.1f seconds before sending another message.\n",
-                                 wait_ms / 1000.0);
-                        cchat_send_encrypted(sd, wait_msg, strlen(wait_msg));
+                    if (now - last_global_message_ms < RATE_LIMIT_MS) {
+                        long long wait_ms = RATE_LIMIT_MS - (now - last_global_message_ms);
+                        char reject_msg[64];
+                        snprintf(reject_msg, sizeof(reject_msg), "@REJECT %lld\n", wait_ms);
+                        cchat_send_encrypted(sd, reject_msg, strlen(reject_msg));
                         continue;
                     }
-                    client_last_message_ms[i] = now;
+                    last_global_message_ms = now;
+
+                    char cooldown_msg[64];
+                    snprintf(cooldown_msg, sizeof(cooldown_msg), "@COOLDOWN %d\n", RATE_LIMIT_MS);
+                    for (int j = 0; j < MAX_CLIENTS; j++) {
+                        int cs = client_sockets[j];
+                        if (cs != 0) {
+                            cchat_send_encrypted(cs, cooldown_msg, strlen(cooldown_msg));
+                        }
+                    }
 
                     save_to_history(buffer);
 

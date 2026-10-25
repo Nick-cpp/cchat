@@ -22,7 +22,7 @@
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
-#define MESSAGE_COOLDOWN_MS 1100
+#define GLOBAL_COOLDOWN_MS 2000
 
 static volatile sig_atomic_t is_running = 1;
 char current_username[MAX_USER_LEN];
@@ -30,6 +30,9 @@ char current_username[MAX_USER_LEN];
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static char input_line[BUFFER_SIZE];
 static size_t input_line_len = 0;
+static char last_sent_message[BUFFER_SIZE];
+static size_t last_sent_len = 0;
+static long long cooldown_until_ms = 0;
 
 static struct termios saved_termios;
 static volatile sig_atomic_t terminal_is_raw = 0;
@@ -181,6 +184,40 @@ void *receive_messages(void *socket_desc) {
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
 
+        if (strncmp(buffer, "@COOLDOWN ", 10) == 0) {
+            long long ms = atoll(buffer + 10);
+            if (ms > 0) {
+                pthread_mutex_lock(&output_lock);
+                long long until = monotonic_ms() + ms;
+                if (until > cooldown_until_ms) {
+                    cooldown_until_ms = until;
+                }
+                pthread_mutex_unlock(&output_lock);
+            }
+            continue;
+        }
+
+        if (strncmp(buffer, "@REJECT ", 8) == 0) {
+            long long ms = atoll(buffer + 8);
+            if (ms < 0) ms = 0;
+
+            pthread_mutex_lock(&output_lock);
+            cooldown_until_ms = monotonic_ms() + ms;
+            clear_input_area_locked();
+
+            if (input_line_len == 0 && last_sent_len > 0) {
+                memcpy(input_line, last_sent_message, last_sent_len + 1);
+                input_line_len = last_sent_len;
+            }
+            last_sent_len = 0;
+
+            printf("[!] Please wait %.1f seconds before sending another message.\n",
+                   ms / 1000.0);
+            draw_prompt_locked();
+            pthread_mutex_unlock(&output_lock);
+            continue;
+        }
+
         pthread_mutex_lock(&output_lock);
         clear_input_area_locked();
         fwrite(buffer, 1, bytes_received, stdout);
@@ -196,7 +233,6 @@ void *receive_messages(void *socket_desc) {
 static void chat_loop(int sock) {
     char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
     int escape_state = 0;
-    long long last_sent_ms = 0;
 
     while (is_running) {
         int ch = fgetc(stdin);
@@ -266,8 +302,9 @@ static void chat_loop(int sock) {
         }
 
         if (ch == '\n' || ch == '\r') {
+            pthread_mutex_lock(&output_lock);
+
             if (input_line_len == 0) {
-                pthread_mutex_lock(&output_lock);
                 clear_input_area_locked();
                 draw_prompt_locked();
                 pthread_mutex_unlock(&output_lock);
@@ -275,12 +312,9 @@ static void chat_loop(int sock) {
             }
 
             long long now = monotonic_ms();
-            if (last_sent_ms != 0 &&
-                now - last_sent_ms < MESSAGE_COOLDOWN_MS) {
-                double wait_seconds =
-                    (MESSAGE_COOLDOWN_MS - (now - last_sent_ms)) / 1000.0;
+            if (cooldown_until_ms > now) {
+                double wait_seconds = (cooldown_until_ms - now) / 1000.0;
 
-                pthread_mutex_lock(&output_lock);
                 clear_input_area_locked();
                 printf("[!] Please wait %.1f seconds before sending another message.\n",
                        wait_seconds);
@@ -292,12 +326,17 @@ static void chat_loop(int sock) {
             char message[BUFFER_SIZE];
             size_t message_len;
 
-            pthread_mutex_lock(&output_lock);
             input_line[input_line_len] = '\0';
             message_len = input_line_len;
             memcpy(message, input_line, message_len + 1);
+
+            /* Keep the raw text so a server rejection can put it back. */
+            memcpy(last_sent_message, message, message_len + 1);
+            last_sent_len = message_len;
+
             input_line_len = 0;
             input_line[0] = '\0';
+            cooldown_until_ms = monotonic_ms() + GLOBAL_COOLDOWN_MS;
             putchar('\n');
             draw_prompt_locked();
             pthread_mutex_unlock(&output_lock);
@@ -308,7 +347,6 @@ static void chat_loop(int sock) {
                 is_running = 0;
                 break;
             }
-            last_sent_ms = monotonic_ms();
             continue;
         }
 
@@ -438,7 +476,7 @@ int main() {
         if (strcmp(response, "ERR_USER_EXISTS") == 0) {
             printf("\n[Error]: User already exists.\n");
         } else if (strcmp(response, "ERR_BANNED") == 0) {
-            printf("\n[Error]: You are temporarily banned for spamming.\n");
+            printf("\n[Error]: You are permanently banned for spamming.\n");
         } else {
             printf("\n[Error]: Invalid username or password.\n");
         }
