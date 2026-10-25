@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <termios.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -21,6 +22,7 @@
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
+#define MESSAGE_COOLDOWN_MS 1100
 
 static volatile sig_atomic_t is_running = 1;
 char current_username[MAX_USER_LEN];
@@ -115,6 +117,12 @@ static int read_password(const char *prompt, char *password, size_t size) {
     return 1;
 }
 
+static long long monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static size_t display_columns(const char *text, size_t len) {
     size_t columns = 0;
     for (size_t i = 0; i < len; i++) {
@@ -188,6 +196,7 @@ void *receive_messages(void *socket_desc) {
 static void chat_loop(int sock) {
     char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
     int escape_state = 0;
+    long long last_sent_ms = 0;
 
     while (is_running) {
         int ch = fgetc(stdin);
@@ -257,33 +266,49 @@ static void chat_loop(int sock) {
         }
 
         if (ch == '\n' || ch == '\r') {
+            if (input_line_len == 0) {
+                pthread_mutex_lock(&output_lock);
+                clear_input_area_locked();
+                draw_prompt_locked();
+                pthread_mutex_unlock(&output_lock);
+                continue;
+            }
+
+            long long now = monotonic_ms();
+            if (last_sent_ms != 0 &&
+                now - last_sent_ms < MESSAGE_COOLDOWN_MS) {
+                double wait_seconds =
+                    (MESSAGE_COOLDOWN_MS - (now - last_sent_ms)) / 1000.0;
+
+                pthread_mutex_lock(&output_lock);
+                clear_input_area_locked();
+                printf("[!] Please wait %.1f seconds before sending another message.\n",
+                       wait_seconds);
+                draw_prompt_locked();
+                pthread_mutex_unlock(&output_lock);
+                continue;
+            }
+
             char message[BUFFER_SIZE];
-            size_t message_len = 0;
-            int send_message = 0;
+            size_t message_len;
 
             pthread_mutex_lock(&output_lock);
-            if (input_line_len > 0) {
-                input_line[input_line_len] = '\0';
-                message_len = input_line_len;
-                memcpy(message, input_line, message_len + 1);
-                input_line_len = 0;
-                input_line[0] = '\0';
-                putchar('\n');
-                send_message = 1;
-            } else {
-                clear_input_area_locked();
-            }
+            input_line[input_line_len] = '\0';
+            message_len = input_line_len;
+            memcpy(message, input_line, message_len + 1);
+            input_line_len = 0;
+            input_line[0] = '\0';
+            putchar('\n');
             draw_prompt_locked();
             pthread_mutex_unlock(&output_lock);
 
-            if (send_message) {
-                snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n",
-                         current_username, message);
-                if (cchat_send_encrypted(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
-                    is_running = 0;
-                    break;
-                }
+            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n",
+                     current_username, message);
+            if (cchat_send_encrypted(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
+                is_running = 0;
+                break;
             }
+            last_sent_ms = monotonic_ms();
             continue;
         }
 
@@ -412,6 +437,8 @@ int main() {
     if (strncmp(response, "OK", 2) != 0) {
         if (strcmp(response, "ERR_USER_EXISTS") == 0) {
             printf("\n[Error]: User already exists.\n");
+        } else if (strcmp(response, "ERR_BANNED") == 0) {
+            printf("\n[Error]: You are temporarily banned for spamming.\n");
         } else {
             printf("\n[Error]: Invalid username or password.\n");
         }
