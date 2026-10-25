@@ -14,7 +14,7 @@
  * The same key must be defined in server.c.  It is embedded in the source on
  * purpose, so it protects messages in transit but is not a secret.
  */
-#define CHAT_ENCRYPTION_KEY "ILoveYourMom"
+#define CHAT_ENCRYPTION_KEY "YourKey"
 #include "crypto.h"
 
 #define BUFFER_SIZE 1024
