@@ -4,47 +4,34 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/select.h>
-#include <termios.h>
+#include <pthread.h>
 
 #define BUFFER_SIZE 1024
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
-#define SECRET_KEY "YourKey"
 
+int is_running = 1;
 char current_username[MAX_USER_LEN];
-char input_buf[MAX_MSG_LEN + 1];
-int input_len = 0;
-struct termios orig_termios;
 
-void xor_crypt(char *data, size_t len) {
-    size_t key_len = strlen(SECRET_KEY);
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= SECRET_KEY[i % key_len];
+void *receive_messages(void *socket_desc) {
+    int sock = *(int*)socket_desc;
+    char buffer[BUFFER_SIZE];
+    int bytes_received;
+
+    while (is_running && (bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        buffer[bytes_received] = '\0';
+        printf("\r\33[2K%s", buffer);
+        printf("[%s]: ", current_username);
+        fflush(stdout);
     }
-}
-
-void disable_raw_mode() {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-}
-
-void enable_raw_mode() {
-    tcgetattr(STDIN_FILENO, &orig_termios);
-    atexit(disable_raw_mode);
-    struct termios raw = orig_termios;
-    raw.lflag &= ~(ECHO | ICANON);
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-}
-
-void redraw_input_line() {
-    printf("\r\33[2K[%s]: %s", current_username, input_buf);
-    fflush(stdout);
+    return NULL;
 }
 
 int main() {
     int sock = 0;
     struct sockaddr_in serv_addr;
+    pthread_t recv_thread;
     char server_ip[64];
     int port;
 
@@ -83,9 +70,6 @@ int main() {
         while (getchar() != '\n');
     }
 
-    char action_str[8];
-    snprintf(action_str, sizeof(action_str), "%d", choice);
-
     memset(current_username, 0, MAX_USER_LEN);
     printf("Enter username (max 9 characters): ");
     if (fgets(current_username, MAX_USER_LEN, stdin) != NULL) {
@@ -99,7 +83,7 @@ int main() {
         password[strcspn(password, "\r\n")] = 0;
     }
 
-    if (send(sock, action_str, strlen(action_str) + 1, 0) < 0) {
+    if (send(sock, &choice, sizeof(int), 0) < 0) {
         perror("Failed to send action");
         close(sock);
         return 1;
@@ -141,72 +125,37 @@ int main() {
     }
     printf("----------------------------------------\n");
 
-    enable_raw_mode();
-    redraw_input_line();
+    if (pthread_create(&recv_thread, NULL, receive_messages, (void*)&sock) < 0) {
+        perror("Failed to create thread");
+        return 1;
+    }
 
-    while (1) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(STDIN_FILENO, &readfds);
-        FD_SET(sock, &readfds);
-        int max_sd = (sock > STDIN_FILENO) ? sock : STDIN_FILENO;
+    char raw_msg[BUFFER_SIZE];
+    char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
 
-        int activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
-        if (activity < 0) break;
+    printf("[%s]: ", current_username);
+    fflush(stdout);
 
-        if (FD_ISSET(sock, &readfds)) {
-            char buffer[BUFFER_SIZE];
-            int bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0);
-            if (bytes_received <= 0) {
-                disable_raw_mode();
-                printf("\nServer disconnected.\n");
-                break;
+    while (is_running) {
+        if (fgets(raw_msg, BUFFER_SIZE, stdin) != NULL) {
+            if (strlen(raw_msg) > MAX_MSG_LEN) {
+                printf("[!] Message too long (limit %d characters). Truncated.\n", MAX_MSG_LEN);
+                raw_msg[MAX_MSG_LEN] = '\n';
+                raw_msg[MAX_MSG_LEN + 1] = '\0';
             }
 
-            xor_crypt(buffer, bytes_received);
-            buffer[bytes_received] = '\0';
-
-            printf("\r\33[2K%s", buffer);
-            if (buffer[bytes_received - 1] != '\n') {
-                printf("\n");
+            raw_msg[strcspn(raw_msg, "\r\n")] = 0;
+            if (strlen(raw_msg) == 0) {
+                printf("[%s]: ", current_username);
+                fflush(stdout);
+                continue;
             }
-            redraw_input_line();
-        }
 
-        if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            char c;
-            if (read(STDIN_FILENO, &c, 1) != 1) break;
-
-            if (c == '\n' || c == '\r') {
-                if (input_len > 0) {
-                    input_buf[input_len] = '\0';
-                    printf("\n");
-
-                    char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
-                    snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", current_username, input_buf);
-                    
-                    size_t msg_len = strlen(formatted_msg);
-                    xor_crypt(formatted_msg, msg_len);
-                    send(sock, formatted_msg, msg_len, 0);
-
-                    input_len = 0;
-                    input_buf[0] = '\0';
-                }
-                redraw_input_line();
-            } else if (c == 127 || c == '\b') {
-                if (input_len > 0) {
-                    input_len--;
-                    input_buf[input_len] = '\0';
-                    printf("\b \b");
-                    fflush(stdout);
-                }
-            } else {
-                if (input_len < MAX_MSG_LEN - 1) {
-                    input_buf[input_len++] = c;
-                    input_buf[input_len] = '\0';
-                    write(STDOUT_FILENO, &c, 1);
-                }
-            }
+            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", current_username, raw_msg);
+            send(sock, formatted_msg, strlen(formatted_msg), 0);
+            
+            printf("[%s]: ", current_username);
+            fflush(stdout);
         }
     }
 

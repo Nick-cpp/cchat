@@ -14,18 +14,10 @@
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
-#define SECRET_KEY "YourKey"
 
 #define USERS_FILE "users.txt"
 #define HISTORY_FILE "history.txt"
 #define CONFIG_FILE "host.conf"
-
-void xor_crypt(char *data, size_t len) {
-    size_t key_len = strlen(SECRET_KEY);
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= SECRET_KEY[i % key_len];
-    }
-}
 
 int load_or_create_config() {
     FILE *f = fopen(CONFIG_FILE, "r");
@@ -141,26 +133,20 @@ int handle_auth(int client_sock, char *out_username) {
 }
 
 void send_history(int client_sock) {
-    FILE *f = fopen(HISTORY_FILE, "rb");
+    FILE *f = fopen(HISTORY_FILE, "r");
     if (!f) return;
 
     char line[BUFFER_SIZE];
     while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        xor_crypt(line, len);
-        send(client_sock, line, len, 0);
+        send(client_sock, line, strlen(line), 0);
     }
     fclose(f);
 }
 
 void save_to_history(const char *msg) {
-    FILE *f = fopen(HISTORY_FILE, "ab");
+    FILE *f = fopen(HISTORY_FILE, "a");
     if (f) {
-        char encrypted[BUFFER_SIZE];
-        strncpy(encrypted, msg, BUFFER_SIZE);
-        size_t len = strlen(encrypted);
-        xor_crypt(encrypted, len);
-        fwrite(encrypted, 1, len, f);
+        fprintf(f, "%s", msg);
         fclose(f);
     }
 }
@@ -237,7 +223,6 @@ int main() {
                 char join_msg[BUFFER_SIZE];
                 snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
                 save_to_history(join_msg);
-                xor_crypt(join_msg, strlen(join_msg));
 
                 for (int j = 0; j < MAX_CLIENTS; j++) {
                     int cs = client_sockets[j];
@@ -277,7 +262,6 @@ int main() {
                     char leave_msg[BUFFER_SIZE];
                     snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
                     save_to_history(leave_msg);
-                    xor_crypt(leave_msg, strlen(leave_msg));
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
@@ -292,13 +276,16 @@ int main() {
                 } else {
                     buffer[valread] = '\0';
                     
+                    if (valread > MAX_MSG_LEN) {
+                        buffer[MAX_MSG_LEN] = '\0';
+                    }
+
                     save_to_history(buffer);
-                    xor_crypt(buffer, valread);
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
                         if (cs != 0 && cs != sd) {
-                            send(cs, buffer, valread, 0);
+                            send(cs, buffer, strlen(buffer), 0);
                         }
                     }
                 }
