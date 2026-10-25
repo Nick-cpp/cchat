@@ -83,6 +83,9 @@ int main() {
         while (getchar() != '\n');
     }
 
+    char action_str[8];
+    snprintf(action_str, sizeof(action_str), "%d", choice);
+
     memset(current_username, 0, MAX_USER_LEN);
     printf("Enter username (max 9 characters): ");
     if (fgets(current_username, MAX_USER_LEN, stdin) != NULL) {
@@ -96,7 +99,7 @@ int main() {
         password[strcspn(password, "\r\n")] = 0;
     }
 
-    if (send(sock, &choice, sizeof(int), 0) < 0) {
+    if (send(sock, action_str, strlen(action_str) + 1, 0) < 0) {
         perror("Failed to send action");
         close(sock);
         return 1;

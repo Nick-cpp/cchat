@@ -55,14 +55,15 @@ unsigned long hash_password(const char *str) {
 }
 
 int handle_auth(int client_sock, char *out_username) {
-    int action = 0;
+    char action_str[8];
     char username[MAX_USER_LEN];
     char password[MAX_PASS_LEN];
 
+    memset(action_str, 0, sizeof(action_str));
     memset(username, 0, sizeof(username));
     memset(password, 0, sizeof(password));
 
-    if (recv(client_sock, &action, sizeof(int), 0) <= 0) return 0;
+    if (recv(client_sock, action_str, sizeof(action_str) - 1, 0) <= 0) return 0;
     if (recv(client_sock, username, MAX_USER_LEN, 0) <= 0) return 0;
     if (recv(client_sock, password, MAX_PASS_LEN, 0) <= 0) return 0;
 
@@ -86,7 +87,7 @@ int handle_auth(int client_sock, char *out_username) {
         fclose(f);
     }
 
-    if (action == 2) {
+    if (strcmp(action_str, "2") == 0) { // Регистрация
         if (user_exists) {
             char *msg = "ERR_USER_EXISTS";
             send(client_sock, msg, strlen(msg) + 1, 0);
@@ -106,7 +107,7 @@ int handle_auth(int client_sock, char *out_username) {
             strcpy(out_username, username);
             return 1;
         }
-    } else {
+    } else { // Вход (по умолчанию)
         if (!user_exists) {
             char *msg = "ERR_INVALID_CREDENTIALS";
             send(client_sock, msg, strlen(msg) + 1, 0);
