@@ -232,17 +232,21 @@ int main() {
 
             if (handle_auth(new_socket, auth_user)) {
                 printf("Client %s successfully authorized!\n", auth_user);
+                
                 send_history(new_socket);
 
                 char join_msg[BUFFER_SIZE];
                 snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
                 save_to_history(join_msg);
-                xor_crypt(join_msg, strlen(join_msg));
+                
+                char enc_join[BUFFER_SIZE];
+                strcpy(enc_join, join_msg);
+                xor_crypt(enc_join, strlen(enc_join));
 
                 for (int j = 0; j < MAX_CLIENTS; j++) {
                     int cs = client_sockets[j];
                     if (cs != 0) {
-                        send(cs, join_msg, strlen(join_msg), 0);
+                        send(cs, enc_join, strlen(enc_join), 0);
                     }
                 }
 

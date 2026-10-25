@@ -30,7 +30,11 @@ void *receive_messages(void *socket_desc) {
     while (is_running && (bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0)) > 0) {
         xor_crypt(buffer, bytes_received);
         buffer[bytes_received] = '\0';
+        
         printf("\r\33[2K%s", buffer);
+        if (buffer[bytes_received - 1] != '\n') {
+            printf("\n");
+        }
         printf("[%s]: ", current_username);
         fflush(stdout);
     }
