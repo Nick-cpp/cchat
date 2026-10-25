@@ -6,6 +6,13 @@
 #include <sys/socket.h>
 #include <pthread.h>
 
+/*
+ * The same key must be defined in server.c.  It is embedded in the source on
+ * purpose, so it protects messages in transit but is not a secret.
+ */
+#define CHAT_ENCRYPTION_KEY "cchat-embedded-key-2026-do-not-use-in-production"
+#include "crypto.h"
+
 #define BUFFER_SIZE 1024
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
@@ -17,9 +24,11 @@ char current_username[MAX_USER_LEN];
 void *receive_messages(void *socket_desc) {
     int sock = *(int*)socket_desc;
     char buffer[BUFFER_SIZE];
-    int bytes_received;
+    size_t bytes_received;
 
-    while (is_running && (bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+    while (is_running) {
+        int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
+        if (rc <= 0) break;
         buffer[bytes_received] = '\0';
         printf("\r\33[2K%s", buffer);
         printf("[%s]: ", current_username);
@@ -83,30 +92,27 @@ int main() {
         password[strcspn(password, "\r\n")] = 0;
     }
 
-    if (send(sock, &choice, sizeof(int), 0) < 0) {
-        perror("Failed to send action");
-        close(sock);
-        return 1;
-    }
-    if (send(sock, current_username, MAX_USER_LEN, 0) < 0) {
-        perror("Failed to send username");
-        close(sock);
-        return 1;
-    }
-    if (send(sock, password, MAX_PASS_LEN, 0) < 0) {
-        perror("Failed to send password");
+    char auth_data[sizeof(int) + MAX_USER_LEN + MAX_PASS_LEN];
+    memset(auth_data, 0, sizeof(auth_data));
+    memcpy(auth_data, &choice, sizeof(int));
+    memcpy(auth_data + sizeof(int), current_username, MAX_USER_LEN);
+    memcpy(auth_data + sizeof(int) + MAX_USER_LEN, password, MAX_PASS_LEN);
+
+    if (cchat_send_encrypted(sock, auth_data, sizeof(auth_data)) <= 0) {
+        perror("Failed to send credentials");
         close(sock);
         return 1;
     }
 
     char response[64];
-    memset(response, 0, sizeof(response));
-    int bytes_read = recv(sock, response, sizeof(response) - 1, 0);
-    if (bytes_read <= 0) {
+    size_t response_len = 0;
+    int auth_rc = cchat_recv_encrypted(sock, response, sizeof(response) - 1, &response_len);
+    if (auth_rc <= 0) {
         printf("Server disconnected or did not respond.\n");
         close(sock);
         return 0;
     }
+    response[response_len] = '\0';
 
     if (strncmp(response, "OK", 2) != 0) {
         if (strcmp(response, "ERR_USER_EXISTS") == 0) {
@@ -137,26 +143,31 @@ int main() {
     fflush(stdout);
 
     while (is_running) {
-        if (fgets(raw_msg, BUFFER_SIZE, stdin) != NULL) {
-            if (strlen(raw_msg) > MAX_MSG_LEN) {
-                printf("[!] Message too long (limit %d characters). Truncated.\n", MAX_MSG_LEN);
-                raw_msg[MAX_MSG_LEN] = '\n';
-                raw_msg[MAX_MSG_LEN + 1] = '\0';
-            }
+        if (fgets(raw_msg, BUFFER_SIZE, stdin) == NULL) {
+            is_running = 0;
+            break;
+        }
 
-            raw_msg[strcspn(raw_msg, "\r\n")] = 0;
-            if (strlen(raw_msg) == 0) {
-                printf("[%s]: ", current_username);
-                fflush(stdout);
-                continue;
-            }
+        if (strlen(raw_msg) > MAX_MSG_LEN) {
+            printf("[!] Message too long (limit %d characters). Truncated.\n", MAX_MSG_LEN);
+            raw_msg[MAX_MSG_LEN] = '\n';
+            raw_msg[MAX_MSG_LEN + 1] = '\0';
+        }
 
-            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", current_username, raw_msg);
-            send(sock, formatted_msg, strlen(formatted_msg), 0);
-            
+        raw_msg[strcspn(raw_msg, "\r\n")] = 0;
+        if (strlen(raw_msg) == 0) {
             printf("[%s]: ", current_username);
             fflush(stdout);
+            continue;
         }
+
+        snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", current_username, raw_msg);
+        if (cchat_send_encrypted(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
+            break;
+        }
+
+        printf("[%s]: ", current_username);
+        fflush(stdout);
     }
 
     close(sock);

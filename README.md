@@ -1,2 +1,3 @@
 # cchat
-Chat server and client made in C
+
+Chat server and client made in C.

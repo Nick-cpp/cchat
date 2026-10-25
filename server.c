@@ -8,6 +8,13 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 
+/*
+ * The same key must be defined in client.c.  It is embedded in the source on
+ * purpose, so it protects messages in transit but is not a secret.
+ */
+#define CHAT_ENCRYPTION_KEY "cchat-embedded-key-2026-do-not-use-in-production"
+#include "crypto.h"
+
 #define DEFAULT_PORT 8080
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
@@ -50,16 +57,26 @@ int handle_auth(int client_sock, char *out_username) {
     int action = 0;
     char username[MAX_USER_LEN];
     char password[MAX_PASS_LEN];
+    char auth_data[sizeof(int) + MAX_USER_LEN + MAX_PASS_LEN];
+    size_t auth_len = 0;
 
     memset(username, 0, sizeof(username));
     memset(password, 0, sizeof(password));
+    memset(auth_data, 0, sizeof(auth_data));
 
-    if (recv(client_sock, &action, sizeof(int), 0) <= 0) return 0;
-    if (recv(client_sock, username, MAX_USER_LEN, 0) <= 0) return 0;
-    if (recv(client_sock, password, MAX_PASS_LEN, 0) <= 0) return 0;
+    if (cchat_recv_encrypted(client_sock, auth_data, sizeof(auth_data), &auth_len) != 1) {
+        return 0;
+    }
+    if (auth_len != sizeof(auth_data)) return 0;
+
+    memcpy(&action, auth_data, sizeof(int));
+    memcpy(username, auth_data + sizeof(int), MAX_USER_LEN);
+    memcpy(password, auth_data + sizeof(int) + MAX_USER_LEN, MAX_PASS_LEN);
 
     username[MAX_USER_LEN - 1] = '\0';
     password[MAX_PASS_LEN - 1] = '\0';
+
+    if (action != 1 && action != 2) return 0;
 
     unsigned long p_hash = hash_password(password);
 
@@ -81,27 +98,27 @@ int handle_auth(int client_sock, char *out_username) {
     if (action == 2) {
         if (user_exists) {
             char *msg = "ERR_USER_EXISTS";
-            send(client_sock, msg, strlen(msg) + 1, 0);
+            cchat_send_encrypted(client_sock, msg, strlen(msg) + 1);
             return 0;
         } else {
             f = fopen(USERS_FILE, "a");
             if (!f) {
                 char *msg = "ERR_SERVER";
-                send(client_sock, msg, strlen(msg) + 1, 0);
+                cchat_send_encrypted(client_sock, msg, strlen(msg) + 1);
                 return 0;
             }
             fprintf(f, "%s %lu\n", username, p_hash);
             fclose(f);
 
             char *msg = "OK";
-            send(client_sock, msg, strlen(msg) + 1, 0);
+            cchat_send_encrypted(client_sock, msg, strlen(msg) + 1);
             strcpy(out_username, username);
             return 1;
         }
     } else {
         if (!user_exists) {
             char *msg = "ERR_INVALID_CREDENTIALS";
-            send(client_sock, msg, strlen(msg) + 1, 0);
+            cchat_send_encrypted(client_sock, msg, strlen(msg) + 1);
             return 0;
         }
 
@@ -121,12 +138,12 @@ int handle_auth(int client_sock, char *out_username) {
 
         if (authenticated) {
             char *msg = "OK";
-            send(client_sock, msg, strlen(msg) + 1, 0);
+            cchat_send_encrypted(client_sock, msg, strlen(msg) + 1);
             strcpy(out_username, username);
             return 1;
         } else {
             char *msg = "ERR_INVALID_CREDENTIALS";
-            send(client_sock, msg, strlen(msg) + 1, 0);
+            cchat_send_encrypted(client_sock, msg, strlen(msg) + 1);
             return 0;
         }
     }
@@ -138,7 +155,7 @@ void send_history(int client_sock) {
 
     char line[BUFFER_SIZE];
     while (fgets(line, sizeof(line), f)) {
-        send(client_sock, line, strlen(line), 0);
+        cchat_send_encrypted(client_sock, line, strlen(line));
     }
     fclose(f);
 }
@@ -154,7 +171,8 @@ void save_to_history(const char *msg) {
 int main() {
     int PORT = load_or_create_config();
 
-    int server_fd, new_socket, client_sockets[MAX_CLIENTS], max_sd, sd, activity, valread;
+    int server_fd, new_socket, client_sockets[MAX_CLIENTS], max_sd, sd, activity;
+    size_t msg_len = 0;
     char client_usernames[MAX_CLIENTS][MAX_USER_LEN];
     int addrlen;
     struct sockaddr_in address;
@@ -227,7 +245,7 @@ int main() {
                 for (int j = 0; j < MAX_CLIENTS; j++) {
                     int cs = client_sockets[j];
                     if (cs != 0) {
-                        send(cs, join_msg, strlen(join_msg), 0);
+                        cchat_send_encrypted(cs, join_msg, strlen(join_msg));
                     }
                 }
 
@@ -254,9 +272,9 @@ int main() {
             sd = client_sockets[i];
 
             if (client_sockets[i] != 0 && FD_ISSET(sd, &readfds)) {
-                valread = read(sd, buffer, BUFFER_SIZE - 1);
+                int msg_rc = cchat_recv_encrypted(sd, buffer, sizeof(buffer) - 1, &msg_len);
                 
-                if (valread <= 0) {
+                if (msg_rc <= 0) {
                     printf("Client %s disconnected.\n", client_usernames[i]);
                     
                     char leave_msg[BUFFER_SIZE];
@@ -266,7 +284,7 @@ int main() {
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
                         if (cs != 0 && cs != sd) {
-                            send(cs, leave_msg, strlen(leave_msg), 0);
+                            cchat_send_encrypted(cs, leave_msg, strlen(leave_msg));
                         }
                     }
 
@@ -274,9 +292,9 @@ int main() {
                     client_sockets[i] = 0;
                     memset(client_usernames[i], 0, MAX_USER_LEN);
                 } else {
-                    buffer[valread] = '\0';
+                    buffer[msg_len] = '\0';
                     
-                    if (valread > MAX_MSG_LEN) {
+                    if (msg_len > MAX_MSG_LEN) {
                         buffer[MAX_MSG_LEN] = '\0';
                     }
 
@@ -285,7 +303,7 @@ int main() {
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
                         if (cs != 0 && cs != sd) {
-                            send(cs, buffer, strlen(buffer), 0);
+                            cchat_send_encrypted(cs, buffer, strlen(buffer));
                         }
                     }
                 }
