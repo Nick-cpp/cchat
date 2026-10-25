@@ -26,11 +26,12 @@
 #define HISTORY_CONFIG_FILE "history.conf"
 #define DELAY_CONFIG_FILE "delay.conf"
 #define KEY_CONFIG_FILE "key.conf"
+#define ANTISPAM_CONFIG_FILE "antispam.conf"
 
 /* history.conf: number of history entries to keep (0 = unlimited).
-   delay.conf: global delay in seconds for all users (0 = disabled). */
+   delay.conf: global delay in seconds for all users (0 = disabled).
+   antispam.conf: repeat count limit for spam ban (0 = disabled). */
 #define MAX_DELAY_SECONDS 86400
-#define SPAM_REPEAT_LIMIT 5
 
 int load_or_create_config() {
     FILE *f = fopen(CONFIG_FILE, "r");
@@ -312,6 +313,7 @@ int main() {
     int PORT = load_or_create_config();
     long long history_limit = load_nonnegative_config(HISTORY_CONFIG_FILE, 0);
     long long delay_seconds = load_nonnegative_config(DELAY_CONFIG_FILE, 0);
+    long long antispam_limit = load_nonnegative_config(ANTISPAM_CONFIG_FILE, 0);
 
     if (delay_seconds > MAX_DELAY_SECONDS) {
         printf("Delay in %s is too large, using %d seconds.\n",
@@ -324,6 +326,7 @@ int main() {
 
     printf("History limit: %lld messages (0 = unlimited)\n", history_limit);
     printf("Global delay: %lld seconds\n", delay_seconds);
+    printf("Antispam repeat limit: %lld (0 = disabled)\n", antispam_limit);
 
     int server_fd, new_socket, client_sockets[MAX_CLIENTS], max_sd, sd, activity;
     size_t msg_len = 0;
@@ -486,41 +489,43 @@ int main() {
 
                     long long now = monotonic_ms();
 
-                    if (client_repeat_count[i] > 0 &&
-                        strcmp(client_last_message[i], buffer) == 0) {
-                        client_repeat_count[i]++;
-                    } else {
-                        snprintf(client_last_message[i], sizeof(client_last_message[i]), "%s", buffer);
-                        client_repeat_count[i] = 1;
-                    }
-
-                    if (client_repeat_count[i] >= SPAM_REPEAT_LIMIT) {
-                        ban_username(client_usernames[i]);
-
-                        char ban_msg[BUFFER_SIZE];
-                        snprintf(ban_msg, sizeof(ban_msg),
-                                 "[Server]: You have been permanently banned for spamming.\n");
-                        cchat_send_encrypted(sd, ban_msg, strlen(ban_msg));
-                        printf("Client %s permanently banned for spamming.\n", client_usernames[i]);
-
-                        char leave_msg[BUFFER_SIZE];
-                        snprintf(leave_msg, sizeof(leave_msg),
-                                 "[Server]: User %s left the chat.\n", client_usernames[i]);
-                        save_to_history(leave_msg, history_limit);
-
-                        for (int j = 0; j < MAX_CLIENTS; j++) {
-                            int cs = client_sockets[j];
-                            if (cs != 0 && cs != sd) {
-                                cchat_send_encrypted(cs, leave_msg, strlen(leave_msg));
-                            }
+                    if (antispam_limit > 0) {
+                        if (client_repeat_count[i] > 0 &&
+                            strcmp(client_last_message[i], buffer) == 0) {
+                            client_repeat_count[i]++;
+                        } else {
+                            snprintf(client_last_message[i], sizeof(client_last_message[i]), "%s", buffer);
+                            client_repeat_count[i] = 1;
                         }
 
-                        close(sd);
-                        client_sockets[i] = 0;
-                        memset(client_usernames[i], 0, MAX_USER_LEN);
-                        client_last_message[i][0] = '\0';
-                        client_repeat_count[i] = 0;
-                        continue;
+                        if (client_repeat_count[i] >= antispam_limit) {
+                            ban_username(client_usernames[i]);
+
+                            char ban_msg[BUFFER_SIZE];
+                            snprintf(ban_msg, sizeof(ban_msg),
+                                     "[Server]: You have been permanently banned for spamming.\n");
+                            cchat_send_encrypted(sd, ban_msg, strlen(ban_msg));
+                            printf("Client %s permanently banned for spamming.\n", client_usernames[i]);
+
+                            char leave_msg[BUFFER_SIZE];
+                            snprintf(leave_msg, sizeof(leave_msg),
+                                     "[Server]: User %s left the chat.\n", client_usernames[i]);
+                            save_to_history(leave_msg, history_limit);
+
+                            for (int j = 0; j < MAX_CLIENTS; j++) {
+                                int cs = client_sockets[j];
+                                if (cs != 0 && cs != sd) {
+                                    cchat_send_encrypted(cs, leave_msg, strlen(leave_msg));
+                                }
+                            }
+
+                            close(sd);
+                            client_sockets[i] = 0;
+                            memset(client_usernames[i], 0, MAX_USER_LEN);
+                            client_last_message[i][0] = '\0';
+                            client_repeat_count[i] = 0;
+                            continue;
+                        }
                     }
 
                     if (rate_limit_ms > 0 && has_global_message &&
