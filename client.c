@@ -2,8 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <termios.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <pthread.h>
 
 /*
@@ -18,8 +22,96 @@
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
 
-int is_running = 1;
+static volatile sig_atomic_t is_running = 1;
 char current_username[MAX_USER_LEN];
+
+static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static char input_line[BUFFER_SIZE];
+static size_t input_line_len = 0;
+
+static struct termios saved_termios;
+static volatile sig_atomic_t terminal_is_raw = 0;
+
+static void restore_terminal(void) {
+    if (terminal_is_raw) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+        terminal_is_raw = 0;
+    }
+}
+
+static void handle_termination_signal(int sig) {
+    restore_terminal();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void setup_terminal(void) {
+    if (!isatty(STDIN_FILENO)) return;
+    if (tcgetattr(STDIN_FILENO, &saved_termios) != 0) return;
+
+    struct termios raw = saved_termios;
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
+
+    terminal_is_raw = 1;
+    atexit(restore_terminal);
+    signal(SIGINT, handle_termination_signal);
+    signal(SIGTERM, handle_termination_signal);
+    signal(SIGHUP, handle_termination_signal);
+    signal(SIGQUIT, handle_termination_signal);
+}
+
+static size_t display_columns(const char *text, size_t len) {
+    size_t columns = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (((unsigned char)text[i] & 0xC0) != 0x80) columns++;
+    }
+    return columns;
+}
+
+static int terminal_columns(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        return ws.ws_col;
+    }
+    return 80;
+}
+
+/* Erases the prompt and the partially typed line, including wrapped rows. */
+static void clear_input_area_locked(void) {
+    int columns = terminal_columns();
+    size_t prompt_columns = strlen(current_username) + 4;
+    size_t total = prompt_columns + display_columns(input_line, input_line_len);
+    int rows = total > 0 ? (int)((total - 1) / (size_t)columns) : 0;
+
+    fputs("\r", stdout);
+    for (int i = 0; i < rows; i++) {
+        fputs("\33[1A", stdout);
+    }
+    fputs("\33[J", stdout);
+}
+
+static void draw_prompt_locked(void) {
+    printf("[%s]: %s", current_username, input_line);
+    fflush(stdout);
+}
+
+static void remove_last_char_locked(void) {
+    if (input_line_len == 0) return;
+
+    size_t start = input_line_len;
+    while (start > 0 && ((unsigned char)input_line[start - 1] & 0xC0) == 0x80) {
+        start--;
+    }
+    if (start > 0) start--;
+
+    input_line_len = start;
+    input_line[input_line_len] = '\0';
+}
 
 void *receive_messages(void *socket_desc) {
     int sock = *(int*)socket_desc;
@@ -30,11 +122,139 @@ void *receive_messages(void *socket_desc) {
         int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
-        printf("\r\33[2K%s", buffer);
-        printf("[%s]: ", current_username);
-        fflush(stdout);
+
+        pthread_mutex_lock(&output_lock);
+        clear_input_area_locked();
+        fwrite(buffer, 1, bytes_received, stdout);
+        if (bytes_received == 0 || buffer[bytes_received - 1] != '\n') {
+            putchar('\n');
+        }
+        draw_prompt_locked();
+        pthread_mutex_unlock(&output_lock);
     }
     return NULL;
+}
+
+static void chat_loop(int sock) {
+    char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
+    int escape_state = 0;
+
+    while (is_running) {
+        int ch = fgetc(stdin);
+
+        if (ch == EOF) {
+            if (ferror(stdin) && errno == EINTR) {
+                clearerr(stdin);
+                continue;
+            }
+            is_running = 0;
+            break;
+        }
+
+        /* Ignore escape sequences such as arrow keys. */
+        if (escape_state) {
+            if (escape_state == 1 && ch == '[') {
+                escape_state = 2;
+            } else {
+                escape_state = 0;
+            }
+            continue;
+        }
+        if (ch == 27) {
+            escape_state = 1;
+            continue;
+        }
+
+        if (ch == 3) { /* Ctrl-C */
+            is_running = 0;
+            break;
+        }
+
+        if (ch == 4) { /* Ctrl-D */
+            if (input_line_len == 0) {
+                is_running = 0;
+                break;
+            }
+            continue;
+        }
+
+        if (ch == 12) { /* Ctrl-L */
+            pthread_mutex_lock(&output_lock);
+            printf("\33[2J\33[H");
+            draw_prompt_locked();
+            pthread_mutex_unlock(&output_lock);
+            continue;
+        }
+
+        if (ch == 21) { /* Ctrl-U */
+            pthread_mutex_lock(&output_lock);
+            while (input_line_len > 0) {
+                remove_last_char_locked();
+            }
+            clear_input_area_locked();
+            draw_prompt_locked();
+            pthread_mutex_unlock(&output_lock);
+            continue;
+        }
+
+        if (ch == 127 || ch == 8) { /* Backspace */
+            pthread_mutex_lock(&output_lock);
+            remove_last_char_locked();
+            clear_input_area_locked();
+            draw_prompt_locked();
+            pthread_mutex_unlock(&output_lock);
+            continue;
+        }
+
+        if (ch == '\n' || ch == '\r') {
+            char message[BUFFER_SIZE];
+            size_t message_len = 0;
+            int send_message = 0;
+
+            pthread_mutex_lock(&output_lock);
+            if (input_line_len > 0) {
+                input_line[input_line_len] = '\0';
+                message_len = input_line_len;
+                memcpy(message, input_line, message_len + 1);
+                input_line_len = 0;
+                input_line[0] = '\0';
+                putchar('\n');
+                send_message = 1;
+            } else {
+                clear_input_area_locked();
+            }
+            draw_prompt_locked();
+            pthread_mutex_unlock(&output_lock);
+
+            if (send_message) {
+                snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n",
+                         current_username, message);
+                if (cchat_send_encrypted(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
+                    is_running = 0;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (ch >= 32) {
+            if (input_line_len < MAX_MSG_LEN) {
+                pthread_mutex_lock(&output_lock);
+                input_line[input_line_len++] = (char)ch;
+                input_line[input_line_len] = '\0';
+                if (terminal_is_raw) {
+                    putchar(ch);
+                    fflush(stdout);
+                }
+                pthread_mutex_unlock(&output_lock);
+            } else if (terminal_is_raw) {
+                pthread_mutex_lock(&output_lock);
+                putchar('\a');
+                fflush(stdout);
+                pthread_mutex_unlock(&output_lock);
+            }
+        }
+    }
 }
 
 int main() {
@@ -131,45 +351,28 @@ int main() {
     }
     printf("----------------------------------------\n");
 
+    setup_terminal();
+
+    pthread_mutex_lock(&output_lock);
+    draw_prompt_locked();
+    pthread_mutex_unlock(&output_lock);
+
     if (pthread_create(&recv_thread, NULL, receive_messages, (void*)&sock) < 0) {
+        restore_terminal();
         perror("Failed to create thread");
+        close(sock);
         return 1;
     }
 
-    char raw_msg[BUFFER_SIZE];
-    char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
+    chat_loop(sock);
 
-    printf("[%s]: ", current_username);
+    is_running = 0;
+    pthread_mutex_lock(&output_lock);
+    putchar('\n');
     fflush(stdout);
+    pthread_mutex_unlock(&output_lock);
 
-    while (is_running) {
-        if (fgets(raw_msg, BUFFER_SIZE, stdin) == NULL) {
-            is_running = 0;
-            break;
-        }
-
-        if (strlen(raw_msg) > MAX_MSG_LEN) {
-            printf("[!] Message too long (limit %d characters). Truncated.\n", MAX_MSG_LEN);
-            raw_msg[MAX_MSG_LEN] = '\n';
-            raw_msg[MAX_MSG_LEN + 1] = '\0';
-        }
-
-        raw_msg[strcspn(raw_msg, "\r\n")] = 0;
-        if (strlen(raw_msg) == 0) {
-            printf("[%s]: ", current_username);
-            fflush(stdout);
-            continue;
-        }
-
-        snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", current_username, raw_msg);
-        if (cchat_send_encrypted(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
-            break;
-        }
-
-        printf("[%s]: ", current_username);
-        fflush(stdout);
-    }
-
+    restore_terminal();
     close(sock);
     return 0;
 }
