@@ -9,11 +9,6 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 
-/*
- * The same key must be defined in client.c.  It is embedded in the source on
- * purpose, so it protects messages in transit but is not a secret.
- */
-#define CHAT_ENCRYPTION_KEY "YourKey"
 #include "crypto.h"
 
 #define DEFAULT_PORT 8080
@@ -22,6 +17,7 @@
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
+#define MAX_KEY_LEN 128
 
 #define USERS_FILE "users.txt"
 #define HISTORY_FILE "history.txt"
@@ -29,6 +25,7 @@
 #define BANNED_FILE "banned.txt"
 #define HISTORY_CONFIG_FILE "history.conf"
 #define DELAY_CONFIG_FILE "delay.conf"
+#define KEY_CONFIG_FILE "key.conf"
 
 /* history.conf: number of history entries to keep (0 = unlimited).
    delay.conf: global delay in seconds for all users (0 = disabled). */
@@ -52,6 +49,27 @@ int load_or_create_config() {
     }
     fclose(f);
     return port;
+}
+
+static void load_or_create_key(char *key_buf, size_t max_len) {
+    FILE *f = fopen(KEY_CONFIG_FILE, "r");
+    if (!f) {
+        f = fopen(KEY_CONFIG_FILE, "w");
+        if (f) {
+            fprintf(f, "YourKey\n");
+            fclose(f);
+        }
+        snprintf(key_buf, max_len, "YourKey");
+        printf("Created config file %s with default key: YourKey\n", KEY_CONFIG_FILE);
+        return;
+    }
+
+    if (fgets(key_buf, max_len, f) != NULL) {
+        key_buf[strcspn(key_buf, "\r\n")] = '\0';
+    } else {
+        snprintf(key_buf, max_len, "YourKey");
+    }
+    fclose(f);
 }
 
 static long long load_nonnegative_config(const char *path, long long default_value) {
@@ -283,6 +301,14 @@ void save_to_history(const char *msg, long long limit) {
 }
 
 int main() {
+    char server_key[MAX_KEY_LEN];
+    load_or_create_key(server_key, sizeof(server_key));
+
+    if (cchat_set_key(server_key) != 0) {
+        fprintf(stderr, "Invalid server encryption key.\n");
+        return 1;
+    }
+
     int PORT = load_or_create_config();
     long long history_limit = load_nonnegative_config(HISTORY_CONFIG_FILE, 0);
     long long delay_seconds = load_nonnegative_config(DELAY_CONFIG_FILE, 0);

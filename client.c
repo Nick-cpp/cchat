@@ -9,13 +9,10 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <pthread.h>
+#include <pwd.h>
 
-/*
- * The same key must be defined in server.c.  It is embedded in the source on
- * purpose, so it protects messages in transit but is not a secret.
- */
-#define CHAT_ENCRYPTION_KEY "YourKey"
 #include "crypto.h"
 
 #define BUFFER_SIZE 1024
@@ -385,6 +382,102 @@ static void chat_loop(int sock) {
     }
 }
 
+/*
+ * Each server has its own key in ~/.cchat/<ip>:<port>.  The file contains the
+ * key on its first line.  ~/.cchat is created when needed, but key files are
+ * never created automatically.
+ */
+#define MAX_KEY_PATH 4096
+
+static int get_home_dir(char *out, size_t size) {
+    const char *home = getenv("HOME");
+    if (home != NULL && home[0] != '\0') {
+        int n = snprintf(out, size, "%s", home);
+        return (n >= 0 && (size_t)n < size) ? 0 : -1;
+    }
+
+    struct passwd *pw = getpwuid(getuid());
+    if (pw == NULL || pw->pw_dir == NULL || pw->pw_dir[0] == '\0') {
+        return -1;
+    }
+
+    int n = snprintf(out, size, "%s", pw->pw_dir);
+    return (n >= 0 && (size_t)n < size) ? 0 : -1;
+}
+
+static int load_server_key(const char *server_ip, int port) {
+    char home[MAX_KEY_PATH];
+    char dir[MAX_KEY_PATH];
+    char path[MAX_KEY_PATH];
+
+    if (get_home_dir(home, sizeof(home)) != 0) {
+        printf("[Error]: Cannot determine home directory.\n");
+        return -1;
+    }
+
+    int n = snprintf(dir, sizeof(dir), "%s/.cchat", home);
+    if (n < 0 || (size_t)n >= sizeof(dir)) {
+        printf("[Error]: Home directory path is too long.\n");
+        return -1;
+    }
+
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        printf("[Error]: Cannot create directory %s: %s\n",
+               dir, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        printf("[Error]: %s is not a directory.\n", dir);
+        return -1;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/%s:%d", dir, server_ip, port);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        printf("[Error]: Key file path is too long.\n");
+        return -1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        printf("[Error]: Key file not found: %s\n", path);
+        printf("Create it and put the server encryption key in it.\n");
+        return -1;
+    }
+
+    char key[CHAT_KEY_MAX + 2];
+    if (fgets(key, sizeof(key), f) == NULL) {
+        fclose(f);
+        printf("[Error]: Key file is empty: %s\n", path);
+        return -1;
+    }
+    fclose(f);
+
+    key[strcspn(key, "\r\n")] = '\0';
+    if (key[0] == '\0') {
+        printf("[Error]: Key file is empty: %s\n", path);
+        memset(key, 0, sizeof(key));
+        return -1;
+    }
+
+    if (strlen(key) > CHAT_KEY_MAX) {
+        printf("[Error]: Key in %s is too long (max %d bytes).\n",
+               path, CHAT_KEY_MAX);
+        memset(key, 0, sizeof(key));
+        return -1;
+    }
+
+    int rc = cchat_set_key(key);
+    memset(key, 0, sizeof(key));
+    if (rc != 0) {
+        printf("[Error]: Invalid key in %s.\n", path);
+        return -1;
+    }
+
+    return 0;
+}
+
 int main() {
     int sock = 0;
     struct sockaddr_in serv_addr;
@@ -401,6 +494,20 @@ int main() {
     if (scanf("%d", &port) != 1) return 1;
     while (getchar() != '\n');
 
+    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
+        printf("Invalid address / Address not supported\n");
+        return -1;
+    }
+
+    if (port <= 0 || port > 65535) {
+        printf("Invalid port\n");
+        return -1;
+    }
+
+    if (load_server_key(server_ip, port) != 0) {
+        return 1;
+    }
+
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         printf("Socket creation error\n");
         return -1;
@@ -408,11 +515,6 @@ int main() {
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        printf("Invalid address / Address not supported\n");
-        return -1;
-    }
 
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         printf("Connection failed\n");

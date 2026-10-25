@@ -4,10 +4,12 @@
 /*
  * Message encryption for cchat.
  *
- * CHAT_ENCRYPTION_KEY must be defined by both client.c and server.c before
- * including this header.  The key is embedded in the source on purpose, as
- * requested, so this only protects message contents from casual interception;
- * anyone who can read the executable/source can recover the key.
+ * The key can be set at runtime with cchat_set_key().  If
+ * CHAT_ENCRYPTION_KEY is defined before including this header, it is used as
+ * the initial key; callers may override it with cchat_set_key().
+ *
+ * This protects message contents from casual interception.  It is not a
+ * replacement for a proper key-exchange protocol.
  */
 
 #include <stdint.h>
@@ -19,9 +21,34 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-#ifndef CHAT_ENCRYPTION_KEY
-#error "Define CHAT_ENCRYPTION_KEY before including crypto.h"
+#define CHAT_KEY_MAX 256
+
+#ifdef CHAT_ENCRYPTION_KEY
+static char cchat_key[CHAT_KEY_MAX + 1] = CHAT_ENCRYPTION_KEY;
+static size_t cchat_key_len = sizeof(CHAT_ENCRYPTION_KEY) - 1;
+#else
+static char cchat_key[CHAT_KEY_MAX + 1];
+static size_t cchat_key_len = 0;
 #endif
+
+static inline int cchat_set_key(const char *key) {
+    if (key == NULL) {
+        cchat_key_len = 0;
+        return -1;
+    }
+
+    size_t len = strlen(key);
+    if (len == 0 || len > CHAT_KEY_MAX) {
+        cchat_key_len = 0;
+        return -1;
+    }
+
+    memset(cchat_key, 0, sizeof(cchat_key));
+    memcpy(cchat_key, key, len);
+    cchat_key[len] = '\0';
+    cchat_key_len = len;
+    return 0;
+}
 
 #define CHAT_CRYPTO_NONCE_LEN 12
 #define CHAT_CRYPTO_TAG_LEN 16
@@ -320,8 +347,7 @@ static void cchat_derive_key(const char *label, uint8_t out[32]) {
     uint8_t master[32];
     cchat_sha256_ctx ctx;
 
-    cchat_sha256((const uint8_t *)CHAT_ENCRYPTION_KEY,
-                 strlen(CHAT_ENCRYPTION_KEY), master);
+    cchat_sha256((const uint8_t *)cchat_key, cchat_key_len, master);
 
     cchat_sha256_init(&ctx);
     cchat_sha256_update(&ctx, (const uint8_t *)label, strlen(label));
@@ -343,6 +369,8 @@ static int cchat_constant_time_equal(const uint8_t *a, const uint8_t *b, size_t 
  */
 static int cchat_encrypt(const void *plain, size_t plain_len,
                          uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (cchat_key_len == 0) return -1;
+
     if (plain_len > CHAT_MAX_FRAME ||
         out_cap < plain_len + CHAT_CRYPTO_OVERHEAD) {
         return -1;
@@ -372,6 +400,8 @@ static int cchat_encrypt(const void *plain, size_t plain_len,
 
 static int cchat_decrypt(const uint8_t *in, size_t in_len,
                          void *plain, size_t plain_cap, size_t *plain_len) {
+    if (cchat_key_len == 0) return -1;
+
     if (in_len < CHAT_CRYPTO_OVERHEAD) return -1;
 
     size_t cipher_len = in_len - CHAT_CRYPTO_OVERHEAD;
