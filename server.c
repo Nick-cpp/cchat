@@ -144,23 +144,18 @@ void send_history(int client_sock) {
     FILE *f = fopen(HISTORY_FILE, "rb");
     if (!f) return;
 
-    char line[BUFFER_SIZE];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        xor_crypt(line, len);
-        send(client_sock, line, len, 0);
+    char buffer[BUFFER_SIZE];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+        send(client_sock, buffer, bytes, 0);
     }
     fclose(f);
 }
 
-void save_to_history(const char *msg) {
+void save_to_history(const char *data, size_t len) {
     FILE *f = fopen(HISTORY_FILE, "ab");
     if (f) {
-        char encrypted[BUFFER_SIZE];
-        strncpy(encrypted, msg, BUFFER_SIZE);
-        size_t len = strlen(encrypted);
-        xor_crypt(encrypted, len);
-        fwrite(encrypted, 1, len, f);
+        fwrite(data, 1, len, f);
         fclose(f);
     }
 }
@@ -236,17 +231,14 @@ int main() {
                 send_history(new_socket);
 
                 char join_msg[BUFFER_SIZE];
-                snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
-                save_to_history(join_msg);
-                
-                char enc_join[BUFFER_SIZE];
-                strcpy(enc_join, join_msg);
-                xor_crypt(enc_join, strlen(enc_join));
+                int j_len = snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
+                xor_crypt(join_msg, j_len);
+                save_to_history(join_msg, j_len);
 
                 for (int j = 0; j < MAX_CLIENTS; j++) {
                     int cs = client_sockets[j];
                     if (cs != 0) {
-                        send(cs, enc_join, strlen(enc_join), 0);
+                        send(cs, join_msg, j_len, 0);
                     }
                 }
 
@@ -279,14 +271,14 @@ int main() {
                     printf("Client %s disconnected.\n", client_usernames[i]);
                     
                     char leave_msg[BUFFER_SIZE];
-                    snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
-                    save_to_history(leave_msg);
-                    xor_crypt(leave_msg, strlen(leave_msg));
+                    int l_len = snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
+                    xor_crypt(leave_msg, l_len);
+                    save_to_history(leave_msg, l_len);
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
                         if (cs != 0 && cs != sd) {
-                            send(cs, leave_msg, strlen(leave_msg), 0);
+                            send(cs, leave_msg, l_len, 0);
                         }
                     }
 
@@ -294,10 +286,7 @@ int main() {
                     client_sockets[i] = 0;
                     memset(client_usernames[i], 0, MAX_USER_LEN);
                 } else {
-                    buffer[valread] = '\0';
-                    
-                    save_to_history(buffer);
-                    xor_crypt(buffer, valread);
+                    save_to_history(buffer, valread);
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
