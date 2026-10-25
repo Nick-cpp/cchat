@@ -19,6 +19,8 @@
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
+#define MAX_HISTORY_DISPLAY 50
+#define MAX_KEY_PATH 4096
 
 static volatile sig_atomic_t is_running = 1;
 char current_username[MAX_USER_LEN];
@@ -29,7 +31,7 @@ static size_t input_line_len = 0;
 static char last_sent_message[BUFFER_SIZE];
 static size_t last_sent_len = 0;
 static long long cooldown_until_ms = 0;
-static long long global_delay_ms = 0; /* Learned from the server via @DELAY. */
+static long long global_delay_ms = 0;
 
 static struct termios saved_termios;
 static volatile sig_atomic_t terminal_is_raw = 0;
@@ -106,11 +108,9 @@ static int read_password(const char *prompt, char *password, size_t size) {
 
     password[strcspn(password, "\r\n")] = '\0';
 
-    /* Discard the rest of an overlong password line. */
     if (!complete_line) {
         int ch;
         while ((ch = getchar()) != '\n' && ch != EOF) {
-            /* discard */
         }
     }
 
@@ -139,7 +139,6 @@ static int terminal_columns(void) {
     return 80;
 }
 
-/* Erases the prompt and the partially typed line, including wrapped rows. */
 static void clear_input_area_locked(void) {
     int columns = terminal_columns();
     size_t prompt_columns = strlen(current_username) + 4;
@@ -256,7 +255,6 @@ static void chat_loop(int sock) {
             break;
         }
 
-        /* Ignore escape sequences such as arrow keys. */
         if (escape_state) {
             if (escape_state == 1 && ch == '[') {
                 escape_state = 2;
@@ -270,12 +268,12 @@ static void chat_loop(int sock) {
             continue;
         }
 
-        if (ch == 3) { /* Ctrl-C */
+        if (ch == 3) {
             is_running = 0;
             break;
         }
 
-        if (ch == 4) { /* Ctrl-D */
+        if (ch == 4) {
             if (input_line_len == 0) {
                 is_running = 0;
                 break;
@@ -283,7 +281,7 @@ static void chat_loop(int sock) {
             continue;
         }
 
-        if (ch == 12) { /* Ctrl-L */
+        if (ch == 12) {
             pthread_mutex_lock(&output_lock);
             printf("\33[2J\33[H");
             draw_prompt_locked();
@@ -291,7 +289,7 @@ static void chat_loop(int sock) {
             continue;
         }
 
-        if (ch == 21) { /* Ctrl-U */
+        if (ch == 21) {
             pthread_mutex_lock(&output_lock);
             while (input_line_len > 0) {
                 remove_last_char_locked();
@@ -302,7 +300,7 @@ static void chat_loop(int sock) {
             continue;
         }
 
-        if (ch == 127 || ch == 8) { /* Backspace */
+        if (ch == 127 || ch == 8) {
             pthread_mutex_lock(&output_lock);
             remove_last_char_locked();
             clear_input_area_locked();
@@ -340,7 +338,6 @@ static void chat_loop(int sock) {
             message_len = input_line_len;
             memcpy(message, input_line, message_len + 1);
 
-            /* Keep the raw text so a server rejection can put it back. */
             memcpy(last_sent_message, message, message_len + 1);
             last_sent_len = message_len;
 
@@ -381,13 +378,6 @@ static void chat_loop(int sock) {
         }
     }
 }
-
-/*
- * Each server has its own key in ~/.cchat/<ip>:<port>.  The file contains the
- * key on its first line.  ~/.cchat is created when needed, but key files are
- * never created automatically.
- */
-#define MAX_KEY_PATH 4096
 
 static int get_home_dir(char *out, size_t size) {
     const char *home = getenv("HOME");
@@ -478,7 +468,109 @@ static int load_server_key(const char *server_ip, int port) {
     return 0;
 }
 
-int main() {
+static void download_full_history(int sock, const char *server_ip, int port) {
+    char home[MAX_KEY_PATH];
+    char out_path[MAX_KEY_PATH];
+
+    if (get_home_dir(home, sizeof(home)) != 0) {
+        printf("[Error]: Cannot determine home directory.\n");
+        return;
+    }
+
+    snprintf(out_path, sizeof(out_path), "%s/%s:%d", home, server_ip, port);
+    FILE *f = fopen(out_path, "w");
+    if (!f) {
+        printf("[Error]: Cannot create history output file %s: %s\n", out_path, strerror(errno));
+        return;
+    }
+
+    char buffer[BUFFER_SIZE];
+    size_t bytes_received;
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    while (1) {
+        int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
+        if (rc <= 0) break;
+        buffer[bytes_received] = '\0';
+
+        if (strncmp(buffer, "@DELAY ", 7) == 0 ||
+            strncmp(buffer, "@COOLDOWN ", 10) == 0) {
+            continue;
+        }
+
+        fwrite(buffer, 1, bytes_received, f);
+    }
+
+    fclose(f);
+    printf("History saved to %s\n", out_path);
+}
+
+static void load_and_display_recent_history(int sock) {
+    char lines[MAX_HISTORY_DISPLAY][BUFFER_SIZE];
+    int count = 0;
+    char buffer[BUFFER_SIZE];
+    size_t bytes_received;
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    while (1) {
+        int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
+        if (rc <= 0) break;
+        buffer[bytes_received] = '\0';
+
+        if (strncmp(buffer, "@DELAY ", 7) == 0) {
+            long long ms = atoll(buffer + 7);
+            if (ms < 0) ms = 0;
+            global_delay_ms = ms;
+            continue;
+        }
+        if (strncmp(buffer, "@COOLDOWN ", 10) == 0) {
+            long long ms = atoll(buffer + 10);
+            if (ms > 0) {
+                long long until = monotonic_ms() + ms;
+                if (until > cooldown_until_ms) {
+                    cooldown_until_ms = until;
+                }
+            }
+            continue;
+        }
+
+        if (count < MAX_HISTORY_DISPLAY) {
+            snprintf(lines[count], BUFFER_SIZE, "%s", buffer);
+            count++;
+        } else {
+            for (int i = 1; i < MAX_HISTORY_DISPLAY; i++) {
+                strcpy(lines[i - 1], lines[i]);
+            }
+            snprintf(lines[MAX_HISTORY_DISPLAY - 1], BUFFER_SIZE, "%s", buffer);
+        }
+    }
+
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    for (int i = 0; i < count; i++) {
+        fputs(lines[i], stdout);
+        if (lines[i][strlen(lines[i]) - 1] != '\n') {
+            putchar('\n');
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int export_history = 0;
+    if (argc > 1 && strcmp(argv[1], "--history") == 0) {
+        export_history = 1;
+    }
+
     int sock = 0;
     struct sockaddr_in serv_addr;
     pthread_t recv_thread;
@@ -492,14 +584,13 @@ int main() {
     if (scanf("%127s", address_input) != 1) return 1;
     while (getchar() != '\n');
 
-    /* Разделяем введенную строку на IP и порт по двоеточию */
     char *colon = strrchr(address_input, ':');
     if (colon == NULL) {
         printf("Invalid format. Please use IP:PORT (e.g., 127.0.0.1:8080)\n");
         return -1;
     }
 
-    *colon = '\0'; // Разрываем строку на IP и порт
+    *colon = '\0';
     snprintf(server_ip, sizeof(server_ip), "%s", address_input);
     port = atoi(colon + 1);
 
@@ -610,12 +701,21 @@ int main() {
         return 0;
     }
 
+    if (export_history) {
+        printf("\nLogin successful! Downloading chat history...\n");
+        download_full_history(sock, server_ip, port);
+        close(sock);
+        return 0;
+    }
+
     if (choice == 2) {
         printf("\nRegistration successful! Entering chat...\n");
     } else {
         printf("\nLogin successful! Loading chat history...\n");
     }
     printf("----------------------------------------\n");
+
+    load_and_display_recent_history(sock);
 
     setup_terminal();
 
