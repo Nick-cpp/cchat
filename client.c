@@ -30,11 +30,7 @@ void *receive_messages(void *socket_desc) {
     while (is_running && (bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0)) > 0) {
         xor_crypt(buffer, bytes_received);
         buffer[bytes_received] = '\0';
-        
         printf("\r\33[2K%s", buffer);
-        if (buffer[bytes_received - 1] != '\n') {
-            printf("\n");
-        }
         printf("[%s]: ", current_username);
         fflush(stdout);
     }
@@ -83,9 +79,6 @@ int main() {
         while (getchar() != '\n');
     }
 
-    char action_str[8];
-    snprintf(action_str, sizeof(action_str), "%d", choice);
-
     memset(current_username, 0, MAX_USER_LEN);
     printf("Enter username (max 9 characters): ");
     if (fgets(current_username, MAX_USER_LEN, stdin) != NULL) {
@@ -99,7 +92,7 @@ int main() {
         password[strcspn(password, "\r\n")] = 0;
     }
 
-    if (send(sock, action_str, strlen(action_str) + 1, 0) < 0) {
+    if (send(sock, &choice, sizeof(int), 0) < 0) {
         perror("Failed to send action");
         close(sock);
         return 1;

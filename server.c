@@ -55,15 +55,14 @@ unsigned long hash_password(const char *str) {
 }
 
 int handle_auth(int client_sock, char *out_username) {
-    char action_str[8];
+    int action = 0;
     char username[MAX_USER_LEN];
     char password[MAX_PASS_LEN];
 
-    memset(action_str, 0, sizeof(action_str));
     memset(username, 0, sizeof(username));
     memset(password, 0, sizeof(password));
 
-    if (recv(client_sock, action_str, sizeof(action_str) - 1, 0) <= 0) return 0;
+    if (recv(client_sock, &action, sizeof(int), 0) <= 0) return 0;
     if (recv(client_sock, username, MAX_USER_LEN, 0) <= 0) return 0;
     if (recv(client_sock, password, MAX_PASS_LEN, 0) <= 0) return 0;
 
@@ -87,7 +86,7 @@ int handle_auth(int client_sock, char *out_username) {
         fclose(f);
     }
 
-    if (strcmp(action_str, "2") == 0) { // Регистрация
+    if (action == 2) {
         if (user_exists) {
             char *msg = "ERR_USER_EXISTS";
             send(client_sock, msg, strlen(msg) + 1, 0);
@@ -107,7 +106,7 @@ int handle_auth(int client_sock, char *out_username) {
             strcpy(out_username, username);
             return 1;
         }
-    } else { // Вход (по умолчанию)
+    } else {
         if (!user_exists) {
             char *msg = "ERR_INVALID_CREDENTIALS";
             send(client_sock, msg, strlen(msg) + 1, 0);
@@ -145,18 +144,23 @@ void send_history(int client_sock) {
     FILE *f = fopen(HISTORY_FILE, "rb");
     if (!f) return;
 
-    char buffer[BUFFER_SIZE];
-    size_t bytes;
-    while ((bytes = fread(buffer, 1, sizeof(buffer), f)) > 0) {
-        send(client_sock, buffer, bytes, 0);
+    char line[BUFFER_SIZE];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        xor_crypt(line, len);
+        send(client_sock, line, len, 0);
     }
     fclose(f);
 }
 
-void save_to_history(const char *data, size_t len) {
+void save_to_history(const char *msg) {
     FILE *f = fopen(HISTORY_FILE, "ab");
     if (f) {
-        fwrite(data, 1, len, f);
+        char encrypted[BUFFER_SIZE];
+        strncpy(encrypted, msg, BUFFER_SIZE);
+        size_t len = strlen(encrypted);
+        xor_crypt(encrypted, len);
+        fwrite(encrypted, 1, len, f);
         fclose(f);
     }
 }
@@ -228,18 +232,17 @@ int main() {
 
             if (handle_auth(new_socket, auth_user)) {
                 printf("Client %s successfully authorized!\n", auth_user);
-                
                 send_history(new_socket);
 
                 char join_msg[BUFFER_SIZE];
-                int j_len = snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
-                xor_crypt(join_msg, j_len);
-                save_to_history(join_msg, j_len);
+                snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
+                save_to_history(join_msg);
+                xor_crypt(join_msg, strlen(join_msg));
 
                 for (int j = 0; j < MAX_CLIENTS; j++) {
                     int cs = client_sockets[j];
                     if (cs != 0) {
-                        send(cs, join_msg, j_len, 0);
+                        send(cs, join_msg, strlen(join_msg), 0);
                     }
                 }
 
@@ -272,14 +275,14 @@ int main() {
                     printf("Client %s disconnected.\n", client_usernames[i]);
                     
                     char leave_msg[BUFFER_SIZE];
-                    int l_len = snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
-                    xor_crypt(leave_msg, l_len);
-                    save_to_history(leave_msg, l_len);
+                    snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
+                    save_to_history(leave_msg);
+                    xor_crypt(leave_msg, strlen(leave_msg));
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
                         if (cs != 0 && cs != sd) {
-                            send(cs, leave_msg, l_len, 0);
+                            send(cs, leave_msg, strlen(leave_msg), 0);
                         }
                     }
 
@@ -287,7 +290,10 @@ int main() {
                     client_sockets[i] = 0;
                     memset(client_usernames[i], 0, MAX_USER_LEN);
                 } else {
-                    save_to_history(buffer, valread);
+                    buffer[valread] = '\0';
+                    
+                    save_to_history(buffer);
+                    xor_crypt(buffer, valread);
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
