@@ -14,7 +14,7 @@
  * The same key must be defined in server.c.  It is embedded in the source on
  * purpose, so it protects messages in transit but is not a secret.
  */
-#define CHAT_ENCRYPTION_KEY "YourKey"
+#define CHAT_ENCRYPTION_KEY "ILoveYourMom"
 #include "crypto.h"
 
 #define BUFFER_SIZE 1024
@@ -32,6 +32,9 @@ static size_t input_line_len = 0;
 static struct termios saved_termios;
 static volatile sig_atomic_t terminal_is_raw = 0;
 
+static struct termios password_saved_termios;
+static volatile sig_atomic_t password_echo_disabled = 0;
+
 static void restore_terminal(void) {
     if (terminal_is_raw) {
         tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
@@ -39,10 +42,27 @@ static void restore_terminal(void) {
     }
 }
 
+static void restore_password_echo(void) {
+    if (password_echo_disabled) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &password_saved_termios);
+        password_echo_disabled = 0;
+    }
+}
+
 static void handle_termination_signal(int sig) {
+    restore_password_echo();
     restore_terminal();
     signal(sig, SIG_DFL);
     raise(sig);
+}
+
+static void install_cleanup_handlers(void) {
+    atexit(restore_password_echo);
+    atexit(restore_terminal);
+    signal(SIGINT, handle_termination_signal);
+    signal(SIGTERM, handle_termination_signal);
+    signal(SIGHUP, handle_termination_signal);
+    signal(SIGQUIT, handle_termination_signal);
 }
 
 static void setup_terminal(void) {
@@ -58,11 +78,41 @@ static void setup_terminal(void) {
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return;
 
     terminal_is_raw = 1;
-    atexit(restore_terminal);
-    signal(SIGINT, handle_termination_signal);
-    signal(SIGTERM, handle_termination_signal);
-    signal(SIGHUP, handle_termination_signal);
-    signal(SIGQUIT, handle_termination_signal);
+}
+
+static int read_password(const char *prompt, char *password, size_t size) {
+    printf("%s", prompt);
+    fflush(stdout);
+
+    if (isatty(STDIN_FILENO) &&
+        tcgetattr(STDIN_FILENO, &password_saved_termios) == 0) {
+        struct termios no_echo = password_saved_termios;
+        no_echo.c_lflag &= ~ECHO;
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &no_echo) == 0) {
+            password_echo_disabled = 1;
+        }
+    }
+
+    char *result = fgets(password, (int)size, stdin);
+    int complete_line = result != NULL && strchr(password, '\n') != NULL;
+
+    restore_password_echo();
+    putchar('\n');
+    fflush(stdout);
+
+    if (result == NULL) return 0;
+
+    password[strcspn(password, "\r\n")] = '\0';
+
+    /* Discard the rest of an overlong password line. */
+    if (!complete_line) {
+        int ch;
+        while ((ch = getchar()) != '\n' && ch != EOF) {
+            /* discard */
+        }
+    }
+
+    return 1;
 }
 
 static size_t display_columns(const char *text, size_t len) {
@@ -264,6 +314,8 @@ int main() {
     char server_ip[64];
     int port;
 
+    install_cleanup_handlers();
+
     printf("Enter server IP address (e.g., 127.0.0.1): ");
     if (scanf("%63s", server_ip) != 1) return 1;
 
@@ -307,9 +359,32 @@ int main() {
 
     char password[MAX_PASS_LEN];
     memset(password, 0, MAX_PASS_LEN);
-    printf("Enter password (max 63 characters): ");
-    if (fgets(password, MAX_PASS_LEN, stdin) != NULL) {
-        password[strcspn(password, "\r\n")] = 0;
+    if (!read_password("Enter password (max 63 characters): ", password, sizeof(password))) {
+        close(sock);
+        return 0;
+    }
+
+    if (choice == 2) {
+        char confirmation[MAX_PASS_LEN];
+
+        for (;;) {
+            memset(confirmation, 0, sizeof(confirmation));
+            if (!read_password("Confirm password: ", confirmation, sizeof(confirmation))) {
+                close(sock);
+                return 0;
+            }
+
+            if (strcmp(password, confirmation) == 0) break;
+
+            printf("[Error]: Passwords do not match. Try again.\n");
+            memset(password, 0, sizeof(password));
+            if (!read_password("Enter password (max 63 characters): ", password, sizeof(password))) {
+                close(sock);
+                return 0;
+            }
+        }
+
+        memset(confirmation, 0, sizeof(confirmation));
     }
 
     char auth_data[sizeof(int) + MAX_USER_LEN + MAX_PASS_LEN];
