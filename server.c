@@ -27,8 +27,12 @@
 #define HISTORY_FILE "history.txt"
 #define CONFIG_FILE "host.conf"
 #define BANNED_FILE "banned.txt"
+#define HISTORY_CONFIG_FILE "history.conf"
+#define DELAY_CONFIG_FILE "delay.conf"
 
-#define RATE_LIMIT_MS 2000
+/* history.conf: number of history entries to keep (0 = unlimited).
+   delay.conf: global delay in seconds for all users (0 = disabled). */
+#define MAX_DELAY_SECONDS 86400
 #define SPAM_REPEAT_LIMIT 5
 
 int load_or_create_config() {
@@ -48,6 +52,27 @@ int load_or_create_config() {
     }
     fclose(f);
     return port;
+}
+
+static long long load_nonnegative_config(const char *path, long long default_value) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "%lld\n", default_value);
+            fclose(f);
+            printf("Created config file %s with default value: %lld\n", path, default_value);
+        }
+        return default_value;
+    }
+
+    long long value = default_value;
+    if (fscanf(f, "%lld", &value) != 1 || value < 0) {
+        printf("Invalid value in %s, using default: %lld\n", path, default_value);
+        value = default_value;
+    }
+    fclose(f);
+    return value;
 }
 
 unsigned long hash_password(const char *str) {
@@ -204,22 +229,82 @@ void send_history(int client_sock) {
     fclose(f);
 }
 
-void save_to_history(const char *msg) {
+static void trim_history(long long limit) {
+    if (limit <= 0) return;
+
+    FILE *f = fopen(HISTORY_FILE, "r");
+    if (!f) return;
+
+    long long line_count = 0;
+    char line[BUFFER_SIZE];
+    while (fgets(line, sizeof(line), f)) {
+        line_count++;
+    }
+
+    if (line_count <= limit) {
+        fclose(f);
+        return;
+    }
+
+    long long skip = line_count - limit;
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+
+    FILE *tmp = fopen(HISTORY_FILE ".tmp", "w");
+    if (!tmp) {
+        fclose(f);
+        return;
+    }
+
+    for (long long i = 0; i < skip; i++) {
+        if (!fgets(line, sizeof(line), f)) break;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        fputs(line, tmp);
+    }
+
+    fclose(tmp);
+    fclose(f);
+
+    if (rename(HISTORY_FILE ".tmp", HISTORY_FILE) != 0) {
+        remove(HISTORY_FILE ".tmp");
+    }
+}
+
+void save_to_history(const char *msg, long long limit) {
     FILE *f = fopen(HISTORY_FILE, "a");
     if (f) {
         fprintf(f, "%s", msg);
         fclose(f);
+        trim_history(limit);
     }
 }
 
 int main() {
     int PORT = load_or_create_config();
+    long long history_limit = load_nonnegative_config(HISTORY_CONFIG_FILE, 0);
+    long long delay_seconds = load_nonnegative_config(DELAY_CONFIG_FILE, 0);
+
+    if (delay_seconds > MAX_DELAY_SECONDS) {
+        printf("Delay in %s is too large, using %d seconds.\n",
+               DELAY_CONFIG_FILE, MAX_DELAY_SECONDS);
+        delay_seconds = MAX_DELAY_SECONDS;
+    }
+    long long rate_limit_ms = delay_seconds * 1000;
+
+    trim_history(history_limit);
+
+    printf("History limit: %lld messages (0 = unlimited)\n", history_limit);
+    printf("Global delay: %lld seconds\n", delay_seconds);
 
     int server_fd, new_socket, client_sockets[MAX_CLIENTS], max_sd, sd, activity;
     size_t msg_len = 0;
     char client_usernames[MAX_CLIENTS][MAX_USER_LEN];
     char client_last_message[MAX_CLIENTS][BUFFER_SIZE];
-    long long last_global_message_ms = -RATE_LIMIT_MS;
+    long long last_global_message_ms = 0;
+    int has_global_message = 0;
     int client_repeat_count[MAX_CLIENTS];
     int addrlen;
     struct sockaddr_in address;
@@ -286,19 +371,25 @@ int main() {
             if (handle_auth(new_socket, auth_user)) {
                 printf("Client %s successfully authorized!\n", auth_user);
 
-                long long elapsed = monotonic_ms() - last_global_message_ms;
-                if (elapsed < RATE_LIMIT_MS) {
-                    char cooldown_msg[64];
-                    snprintf(cooldown_msg, sizeof(cooldown_msg),
-                             "@COOLDOWN %lld\n", RATE_LIMIT_MS - elapsed);
-                    cchat_send_encrypted(new_socket, cooldown_msg, strlen(cooldown_msg));
+                char delay_msg[64];
+                snprintf(delay_msg, sizeof(delay_msg), "@DELAY %lld\n", rate_limit_ms);
+                cchat_send_encrypted(new_socket, delay_msg, strlen(delay_msg));
+
+                if (rate_limit_ms > 0 && has_global_message) {
+                    long long elapsed = monotonic_ms() - last_global_message_ms;
+                    if (elapsed < rate_limit_ms) {
+                        char cooldown_msg[64];
+                        snprintf(cooldown_msg, sizeof(cooldown_msg),
+                                 "@COOLDOWN %lld\n", rate_limit_ms - elapsed);
+                        cchat_send_encrypted(new_socket, cooldown_msg, strlen(cooldown_msg));
+                    }
                 }
 
                 send_history(new_socket);
 
                 char join_msg[BUFFER_SIZE];
                 snprintf(join_msg, sizeof(join_msg), "[Server]: User %s joined the chat.\n", auth_user);
-                save_to_history(join_msg);
+                save_to_history(join_msg, history_limit);
 
                 for (int j = 0; j < MAX_CLIENTS; j++) {
                     int cs = client_sockets[j];
@@ -339,7 +430,7 @@ int main() {
                     
                     char leave_msg[BUFFER_SIZE];
                     snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
-                    save_to_history(leave_msg);
+                    save_to_history(leave_msg, history_limit);
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];
@@ -358,6 +449,13 @@ int main() {
                     
                     if (msg_len > MAX_MSG_LEN) {
                         buffer[MAX_MSG_LEN] = '\0';
+                    }
+
+                    /* Official clients prefix messages with "[username]: ".
+                       Ignore anything else so clients cannot spoof server
+                       control frames such as @COOLDOWN or @DELAY. */
+                    if (buffer[0] != '[') {
+                        continue;
                     }
 
                     long long now = monotonic_ms();
@@ -382,7 +480,7 @@ int main() {
                         char leave_msg[BUFFER_SIZE];
                         snprintf(leave_msg, sizeof(leave_msg),
                                  "[Server]: User %s left the chat.\n", client_usernames[i]);
-                        save_to_history(leave_msg);
+                        save_to_history(leave_msg, history_limit);
 
                         for (int j = 0; j < MAX_CLIENTS; j++) {
                             int cs = client_sockets[j];
@@ -399,25 +497,30 @@ int main() {
                         continue;
                     }
 
-                    if (now - last_global_message_ms < RATE_LIMIT_MS) {
-                        long long wait_ms = RATE_LIMIT_MS - (now - last_global_message_ms);
+                    if (rate_limit_ms > 0 && has_global_message &&
+                        now - last_global_message_ms < rate_limit_ms) {
+                        long long wait_ms = rate_limit_ms - (now - last_global_message_ms);
                         char reject_msg[64];
                         snprintf(reject_msg, sizeof(reject_msg), "@REJECT %lld\n", wait_ms);
                         cchat_send_encrypted(sd, reject_msg, strlen(reject_msg));
                         continue;
                     }
                     last_global_message_ms = now;
+                    has_global_message = 1;
 
-                    char cooldown_msg[64];
-                    snprintf(cooldown_msg, sizeof(cooldown_msg), "@COOLDOWN %d\n", RATE_LIMIT_MS);
-                    for (int j = 0; j < MAX_CLIENTS; j++) {
-                        int cs = client_sockets[j];
-                        if (cs != 0) {
-                            cchat_send_encrypted(cs, cooldown_msg, strlen(cooldown_msg));
+                    if (rate_limit_ms > 0) {
+                        char cooldown_msg[64];
+                        snprintf(cooldown_msg, sizeof(cooldown_msg),
+                                 "@COOLDOWN %lld\n", rate_limit_ms);
+                        for (int j = 0; j < MAX_CLIENTS; j++) {
+                            int cs = client_sockets[j];
+                            if (cs != 0) {
+                                cchat_send_encrypted(cs, cooldown_msg, strlen(cooldown_msg));
+                            }
                         }
                     }
 
-                    save_to_history(buffer);
+                    save_to_history(buffer, history_limit);
 
                     for (int j = 0; j < MAX_CLIENTS; j++) {
                         int cs = client_sockets[j];

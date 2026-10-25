@@ -22,7 +22,6 @@
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
-#define GLOBAL_COOLDOWN_MS 2000
 
 static volatile sig_atomic_t is_running = 1;
 char current_username[MAX_USER_LEN];
@@ -33,6 +32,7 @@ static size_t input_line_len = 0;
 static char last_sent_message[BUFFER_SIZE];
 static size_t last_sent_len = 0;
 static long long cooldown_until_ms = 0;
+static long long global_delay_ms = 0; /* Learned from the server via @DELAY. */
 
 static struct termios saved_termios;
 static volatile sig_atomic_t terminal_is_raw = 0;
@@ -183,6 +183,19 @@ void *receive_messages(void *socket_desc) {
         int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
+
+        if (strncmp(buffer, "@DELAY ", 7) == 0) {
+            long long ms = atoll(buffer + 7);
+            if (ms < 0) ms = 0;
+
+            pthread_mutex_lock(&output_lock);
+            global_delay_ms = ms;
+            if (ms == 0) {
+                cooldown_until_ms = 0;
+            }
+            pthread_mutex_unlock(&output_lock);
+            continue;
+        }
 
         if (strncmp(buffer, "@COOLDOWN ", 10) == 0) {
             long long ms = atoll(buffer + 10);
@@ -336,7 +349,9 @@ static void chat_loop(int sock) {
 
             input_line_len = 0;
             input_line[0] = '\0';
-            cooldown_until_ms = monotonic_ms() + GLOBAL_COOLDOWN_MS;
+            cooldown_until_ms = global_delay_ms > 0
+                ? monotonic_ms() + global_delay_ms
+                : 0;
             putchar('\n');
             draw_prompt_locked();
             pthread_mutex_unlock(&output_lock);
