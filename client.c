@@ -483,16 +483,25 @@ int main() {
     struct sockaddr_in serv_addr;
     pthread_t recv_thread;
     char server_ip[64];
+    char address_input[128];
     int port;
 
     install_cleanup_handlers();
 
-    printf("Enter server IP address (e.g., 127.0.0.1): ");
-    if (scanf("%63s", server_ip) != 1) return 1;
-
-    printf("Enter server port: ");
-    if (scanf("%d", &port) != 1) return 1;
+    printf("Enter server address (e.g., 127.0.0.1:8080): ");
+    if (scanf("%127s", address_input) != 1) return 1;
     while (getchar() != '\n');
+
+    /* Разделяем введенную строку на IP и порт по двоеточию */
+    char *colon = strrchr(address_input, ':');
+    if (colon == NULL) {
+        printf("Invalid format. Please use IP:PORT (e.g., 127.0.0.1:8080)\n");
+        return -1;
+    }
+
+    *colon = '\0'; // Разрываем строку на IP и порт
+    snprintf(server_ip, sizeof(server_ip), "%s", address_input);
+    port = atoi(colon + 1);
 
     if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
         printf("Invalid address / Address not supported\n");
