@@ -436,6 +436,86 @@ static int cchat_decrypt(const uint8_t *in, size_t in_len,
     return 0;
 }
 
+/* ------------------------------ Base64 -------------------------------- */
+
+static const char cchat_b64_alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int cchat_b64_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/* Encodes in_len bytes into out (NUL terminated).  Returns the number of
+   characters written, or -1 when out_cap is too small. */
+static int cchat_b64_encode(const uint8_t *in, size_t in_len,
+                            char *out, size_t out_cap) {
+    size_t need = 4 * ((in_len + 2) / 3);
+    if (out_cap < need + 1) return -1;
+
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < in_len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < in_len) v |= (uint32_t)in[i + 2];
+
+        out[o++] = cchat_b64_alphabet[(v >> 18) & 63];
+        out[o++] = cchat_b64_alphabet[(v >> 12) & 63];
+        out[o++] = (i + 1 < in_len) ? cchat_b64_alphabet[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < in_len) ? cchat_b64_alphabet[v & 63] : '=';
+    }
+    out[o] = '\0';
+    return (int)o;
+}
+
+/* Decodes base64 text.  Whitespace is ignored and padding is optional.
+   Returns 0 on success, -1 on malformed input or if out_cap is too small. */
+static int cchat_b64_decode(const char *in, size_t in_len,
+                            uint8_t *out, size_t out_cap, size_t *out_len) {
+    int vals[4];
+    int n = 0;
+    int pad = 0;
+    size_t o = 0;
+
+    for (size_t i = 0; i < in_len; i++) {
+        char c = in[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+
+        if (c == '=') {
+            if (n < 2) return -1;
+            vals[n++] = 0;
+            pad++;
+        } else {
+            int v = cchat_b64_value(c);
+            if (v < 0) return -1;
+            vals[n++] = v;
+        }
+
+        if (n == 4) {
+            if (pad > 2) return -1;
+            uint32_t v = ((uint32_t)vals[0] << 18) |
+                         ((uint32_t)vals[1] << 12) |
+                         ((uint32_t)vals[2] << 6) |
+                         (uint32_t)vals[3];
+            size_t bytes = 3 - (size_t)pad;
+            if (o + bytes > out_cap) return -1;
+            out[o++] = (uint8_t)(v >> 16);
+            if (pad < 2) out[o++] = (uint8_t)(v >> 8);
+            if (pad < 1) out[o++] = (uint8_t)v;
+            n = 0;
+            pad = 0;
+        }
+    }
+
+    if (n != 0) return -1;
+    *out_len = o;
+    return 0;
+}
+
 /* ------------------------- Framed socket I/O -------------------------- */
 
 static int cchat_send_all(int fd, const void *buf, size_t len) {

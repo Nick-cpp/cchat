@@ -13,7 +13,7 @@
 
 #define DEFAULT_PORT 8080
 #define MAX_CLIENTS 10
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 #define MAX_USER_LEN 10
 #define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
@@ -27,6 +27,13 @@
 #define DELAY_CONFIG_FILE "delay.conf"
 #define KEY_CONFIG_FILE "key.conf"
 #define ANTISPAM_CONFIG_FILE "antispam.conf"
+
+#define FILE_DIR "files"
+#define FILE_INDEX "files.index"
+#define FILE_CHUNK_SIZE 2048
+#define MAX_FILE_SIZE (16LL * 1024 * 1024)
+#define MAX_FILE_NAME 200
+#define MAX_B64_NAME 512
 
 /* history.conf: number of history entries to keep (0 = unlimited).
    delay.conf: global delay in seconds for all users (0 = disabled).
@@ -301,6 +308,315 @@ void save_to_history(const char *msg, long long limit) {
     }
 }
 
+/* --------------------------- File transfers --------------------------- */
+
+typedef struct {
+    int active;
+    FILE *fp;
+    long long id;
+    long long size;
+    long long received;
+    char name[MAX_FILE_NAME + 1];
+    char name_b64[MAX_B64_NAME];
+} upload_state;
+
+static upload_state uploads[MAX_CLIENTS];
+static long long next_file_id = 1;
+
+static void ensure_file_dir(void) {
+    if (mkdir(FILE_DIR, 0755) != 0 && errno != EEXIST) {
+        printf("Warning: cannot create %s: %s\n", FILE_DIR, strerror(errno));
+    }
+}
+
+static void load_next_file_id(void) {
+    next_file_id = 1;
+
+    FILE *f = fopen(FILE_INDEX, "r");
+    if (!f) return;
+
+    long long id, size;
+    char user[MAX_USER_LEN + 1];
+    char b64[MAX_B64_NAME];
+    while (fscanf(f, "%lld %lld %10s %511s", &id, &size, user, b64) == 4) {
+        if (id >= next_file_id) next_file_id = id + 1;
+    }
+    fclose(f);
+}
+
+static void sanitize_file_name(char *name) {
+    for (char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32 || c == 127) *p = '_';
+    }
+}
+
+static int index_lookup(long long id, long long *size, char *name_b64,
+                        size_t name_cap) {
+    FILE *f = fopen(FILE_INDEX, "r");
+    if (!f) return 0;
+
+    long long fid, fsize;
+    char user[MAX_USER_LEN + 1];
+    char b64[MAX_B64_NAME];
+    int found = 0;
+
+    while (fscanf(f, "%lld %lld %10s %511s", &fid, &fsize, user, b64) == 4) {
+        if (fid == id) {
+            if (size) *size = fsize;
+            if (name_b64) snprintf(name_b64, name_cap, "%s", b64);
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void upload_close_file(upload_state *up, int remove_part) {
+    if (up->fp) {
+        fclose(up->fp);
+        up->fp = NULL;
+    }
+    if (remove_part) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%lld.part", FILE_DIR, up->id);
+        remove(path);
+    }
+    up->active = 0;
+}
+
+static void upload_abort(upload_state *up, int sd, const char *reason) {
+    upload_close_file(up, 1);
+    if (sd >= 0) {
+        char msg[BUFFER_SIZE];
+        snprintf(msg, sizeof(msg), "@UPLOAD_ERR %s\n", reason);
+        cchat_send_encrypted(sd, msg, strlen(msg));
+    }
+}
+
+static void handle_upload_begin(upload_state *up, int sd, const char *frame) {
+    long long size;
+    char b64[MAX_B64_NAME];
+
+    if (sscanf(frame + 14, "%lld %511s", &size, b64) != 2) {
+        upload_abort(up, sd, "invalid headers");
+        return;
+    }
+
+    if (size < 0 || size > MAX_FILE_SIZE) {
+        upload_abort(up, sd, "file is too large");
+        return;
+    }
+
+    if (up->active) {
+        upload_abort(up, sd, "previous upload cancelled");
+    }
+
+    uint8_t decoded[MAX_FILE_NAME + 1];
+    size_t decoded_len = 0;
+    if (cchat_b64_decode(b64, strlen(b64), decoded,
+                         sizeof(decoded) - 1, &decoded_len) != 0 ||
+        decoded_len == 0) {
+        upload_abort(up, sd, "invalid file name");
+        return;
+    }
+    decoded[decoded_len] = '\0';
+
+    long long id = next_file_id++;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%lld.part", FILE_DIR, id);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        upload_abort(up, sd, "server cannot create file");
+        return;
+    }
+
+    up->active = 1;
+    up->fp = f;
+    up->id = id;
+    up->size = size;
+    up->received = 0;
+    memcpy(up->name, decoded, decoded_len + 1);
+    up->name[MAX_FILE_NAME] = '\0';
+    sanitize_file_name(up->name);
+    snprintf(up->name_b64, sizeof(up->name_b64), "%s", b64);
+}
+
+static void handle_upload_data(upload_state *up, int sd, const char *frame) {
+    if (!up->active) return;
+
+    uint8_t data[FILE_CHUNK_SIZE + 4];
+    size_t data_len = 0;
+    if (cchat_b64_decode(frame + 13, strlen(frame + 13), data,
+                         sizeof(data), &data_len) != 0) {
+        upload_abort(up, sd, "corrupted upload data");
+        return;
+    }
+
+    if (up->received + (long long)data_len > up->size) {
+        upload_abort(up, sd, "upload exceeds announced size");
+        return;
+    }
+
+    if (data_len > 0 && fwrite(data, 1, data_len, up->fp) != data_len) {
+        upload_abort(up, sd, "server write error");
+        return;
+    }
+    up->received += (long long)data_len;
+}
+
+static void broadcast_to_all(int client_sockets[MAX_CLIENTS],
+                             const char *msg) {
+    for (int j = 0; j < MAX_CLIENTS; j++) {
+        int cs = client_sockets[j];
+        if (cs != 0) {
+            cchat_send_encrypted(cs, msg, strlen(msg));
+        }
+    }
+}
+
+static void handle_upload_end(upload_state *up, int sd, const char *username,
+                              long long history_limit,
+                              int client_sockets[MAX_CLIENTS]) {
+    if (!up->active) return;
+
+    if (up->received != up->size) {
+        upload_abort(up, sd, "incomplete upload");
+        return;
+    }
+
+    fflush(up->fp);
+    fclose(up->fp);
+    up->fp = NULL;
+
+    char part_path[256];
+    char final_path[256];
+    snprintf(part_path, sizeof(part_path), "%s/%lld.part", FILE_DIR, up->id);
+    snprintf(final_path, sizeof(final_path), "%s/%lld", FILE_DIR, up->id);
+
+    if (rename(part_path, final_path) != 0) {
+        upload_abort(up, sd, "server cannot store file");
+        return;
+    }
+
+    FILE *idx = fopen(FILE_INDEX, "a");
+    if (!idx) {
+        remove(final_path);
+        upload_abort(up, sd, "server cannot update file index");
+        return;
+    }
+    fprintf(idx, "%lld %lld %s %s\n", up->id, up->size, username,
+            up->name_b64);
+    fclose(idx);
+
+    char announce[BUFFER_SIZE];
+    snprintf(announce, sizeof(announce),
+             "[Server]: User %s uploaded file #%lld \"%s\" (%lld bytes).\n",
+             username, up->id, up->name, up->size);
+    save_to_history(announce, history_limit);
+    broadcast_to_all(client_sockets, announce);
+
+    up->active = 0;
+}
+
+static void handle_file_list(int sd) {
+    FILE *f = fopen(FILE_INDEX, "r");
+    if (f) {
+        long long id, size;
+        char user[MAX_USER_LEN + 1];
+        char b64[MAX_B64_NAME];
+
+        while (fscanf(f, "%lld %lld %10s %511s", &id, &size, user, b64) == 4) {
+            char line[BUFFER_SIZE];
+            snprintf(line, sizeof(line), "@FILE_ENTRY %lld %lld %s %s\n",
+                     id, size, user, b64);
+            if (cchat_send_encrypted(sd, line, strlen(line)) <= 0) {
+                fclose(f);
+                return;
+            }
+        }
+        fclose(f);
+    }
+
+    const char *end = "@FILE_LIST_END\n";
+    cchat_send_encrypted(sd, end, strlen(end));
+}
+
+static void handle_file_get(int sd, long long id) {
+    long long size = 0;
+    char b64[MAX_B64_NAME];
+
+    if (id <= 0 || !index_lookup(id, &size, b64, sizeof(b64))) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "@FILE_ERR %lld not found\n", id);
+        cchat_send_encrypted(sd, msg, strlen(msg));
+        return;
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%lld", FILE_DIR, id);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "@FILE_ERR %lld missing on server\n", id);
+        cchat_send_encrypted(sd, msg, strlen(msg));
+        return;
+    }
+
+    char line[BUFFER_SIZE];
+    snprintf(line, sizeof(line), "@FILE_BEGIN %lld %lld %s\n", id, size, b64);
+    if (cchat_send_encrypted(sd, line, strlen(line)) <= 0) {
+        fclose(f);
+        return;
+    }
+
+    uint8_t data[FILE_CHUNK_SIZE];
+    char encoded[4 * ((FILE_CHUNK_SIZE + 2) / 3) + 1];
+    size_t n;
+    while ((n = fread(data, 1, sizeof(data), f)) > 0) {
+        if (cchat_b64_encode(data, n, encoded, sizeof(encoded)) < 0) break;
+        snprintf(line, sizeof(line), "@FILE_DATA %lld %s\n", id, encoded);
+        if (cchat_send_encrypted(sd, line, strlen(line)) <= 0) {
+            fclose(f);
+            return;
+        }
+    }
+    fclose(f);
+
+    snprintf(line, sizeof(line), "@FILE_END %lld\n", id);
+    cchat_send_encrypted(sd, line, strlen(line));
+}
+
+static int handle_control_frame(int slot, int sd, const char *frame,
+                                const char *username, long long history_limit,
+                                int client_sockets[MAX_CLIENTS]) {
+    upload_state *up = &uploads[slot];
+
+    if (strncmp(frame, "@UPLOAD_BEGIN ", 14) == 0) {
+        handle_upload_begin(up, sd, frame);
+        return 1;
+    }
+    if (strncmp(frame, "@UPLOAD_DATA ", 13) == 0) {
+        handle_upload_data(up, sd, frame);
+        return 1;
+    }
+    if (strncmp(frame, "@UPLOAD_END", 11) == 0) {
+        handle_upload_end(up, sd, username, history_limit, client_sockets);
+        return 1;
+    }
+    if (strncmp(frame, "@FILE_LIST", 10) == 0) {
+        handle_file_list(sd);
+        return 1;
+    }
+    if (strncmp(frame, "@FILE_GET ", 10) == 0) {
+        handle_file_get(sd, atoll(frame + 10));
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     char server_key[MAX_KEY_LEN];
     load_or_create_key(server_key, sizeof(server_key));
@@ -323,6 +639,12 @@ int main() {
     long long rate_limit_ms = delay_seconds * 1000;
 
     trim_history(history_limit);
+    ensure_file_dir();
+    load_next_file_id();
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        memset(&uploads[i], 0, sizeof(uploads[i]));
+    }
 
     printf("History limit: %lld messages (0 = unlimited)\n", history_limit);
     printf("Global delay: %lld seconds\n", delay_seconds);
@@ -456,6 +778,7 @@ int main() {
                 
                 if (msg_rc <= 0) {
                     printf("Client %s disconnected.\n", client_usernames[i]);
+                    upload_close_file(&uploads[i], 1);
                     
                     char leave_msg[BUFFER_SIZE];
                     snprintf(leave_msg, sizeof(leave_msg), "[Server]: User %s left the chat.\n", client_usernames[i]);
@@ -475,7 +798,14 @@ int main() {
                     client_repeat_count[i] = 0;
                 } else {
                     buffer[msg_len] = '\0';
-                    
+
+                    if (buffer[0] == '@') {
+                        handle_control_frame(i, sd, buffer,
+                                             client_usernames[i],
+                                             history_limit, client_sockets);
+                        continue;
+                    }
+
                     if (msg_len > MAX_MSG_LEN) {
                         buffer[MAX_MSG_LEN] = '\0';
                     }
@@ -500,6 +830,7 @@ int main() {
 
                         if (client_repeat_count[i] >= antispam_limit) {
                             ban_username(client_usernames[i]);
+                            upload_close_file(&uploads[i], 1);
 
                             char ban_msg[BUFFER_SIZE];
                             snprintf(ban_msg, sizeof(ban_msg),
