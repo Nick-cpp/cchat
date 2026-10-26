@@ -26,7 +26,7 @@
 #define MAX_CHAT_LINES 5000
 
 #define FILE_CHUNK_SIZE 2048
-#define MAX_FILE_SIZE (16LL * 1024 * 1024)
+#define DEFAULT_MAX_FILE_SIZE (16LL * 1024 * 1024)
 #define MAX_B64_NAME 512
 #define MAX_REMOTE_FILES 2000
 #define MAX_DOWNLOADS 8
@@ -68,6 +68,7 @@ static char last_sent_message[BUFFER_SIZE];
 static size_t last_sent_len = 0;
 static long long cooldown_until_ms = 0;
 static long long global_delay_ms = 0;
+static long long max_file_size = DEFAULT_MAX_FILE_SIZE;
 
 static pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 static remote_file_info remote_files[MAX_REMOTE_FILES];
@@ -736,6 +737,16 @@ void *receive_messages(void *socket_desc) {
 
         if (handle_file_frame(buffer)) continue;
 
+        if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
+            long long size = atoll(buffer + 15);
+            if (size >= 0) {
+                pthread_mutex_lock(&output_lock);
+                max_file_size = size;
+                pthread_mutex_unlock(&output_lock);
+            }
+            continue;
+        }
+
         if (strncmp(buffer, "@DELAY ", 7) == 0) {
             long long ms = atoll(buffer + 7);
             if (ms < 0) ms = 0;
@@ -1257,11 +1268,16 @@ static void send_file_path(int sock, const char *path) {
         return;
     }
 
-    if (st.st_size > MAX_FILE_SIZE) {
+    pthread_mutex_lock(&output_lock);
+    long long size_limit = max_file_size;
+    pthread_mutex_unlock(&output_lock);
+
+    if ((long long)st.st_size > size_limit) {
         char text[8192];
+        char limit[64];
+        format_file_size(size_limit, limit, sizeof(limit));
         snprintf(text, sizeof(text),
-                 "[!] File \"%s\" is too large (max %lld bytes).",
-                 path, (long long)MAX_FILE_SIZE);
+                 "[!] File \"%s\" is too large (max %s).", path, limit);
         notify(text);
         return;
     }
@@ -1743,6 +1759,12 @@ static void load_history_into_buffer(int sock) {
         int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
+
+        if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
+            long long size = atoll(buffer + 15);
+            if (size >= 0) max_file_size = size;
+            continue;
+        }
 
         if (strncmp(buffer, "@DELAY ", 7) == 0) {
             long long ms = atoll(buffer + 7);

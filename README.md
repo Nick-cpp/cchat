@@ -19,7 +19,8 @@ The chat fills the terminal and keeps the prompt on the bottom line.
 The client can send files to the chat and download them again later.
 
 * Press `Ctrl-O` or type `/upload` to open the built-in file picker.
-  Files are transferred in chunks; the current limit is 16 MiB per file.
+  Files are transferred in chunks; the per-file limit comes from the server
+  (`filesize.conf`, 16 MiB by default).
   * `j`/`k` or the arrow keys move the cursor.
   * `h`/`l` or the left/right arrow keys change directory.
   * `Space` selects or deselects a file.
@@ -27,8 +28,7 @@ The client can send files to the chat and download them again later.
     nothing is selected).
   * `q` or `Esc` cancels.
 * Press `Ctrl-F` or type `/files` to open the server file list.  The list
-  contains every file ever uploaded, so files mentioned in older messages can
-  still be downloaded.
+  contains the files currently stored on the server.
   * `j`/`k` or the arrow keys move the cursor.
   * `Space` selects files, `Enter` downloads them, `q`/`Esc` closes the list.
 * Downloaded files are stored in `~/.cchat/Downloads`.
@@ -39,3 +39,24 @@ The client can send files to the chat and download them again later.
 Uploaded files are announced in the chat with a server-assigned file number.
 The server keeps them in `files/` next to its configuration files; the
 `files.index` file maps file numbers to names.
+
+## Server configuration
+
+`filesize.conf` controls the maximum upload size.  The four values are added
+together:
+
+```
+kb = 0
+mb = 16
+gb = 0
+tb = 0
+```
+
+The example above means 16 MiB.  For example, `mb = 16` and `kb = 512` gives
+16.5 MiB.  The server sends the resulting limit to clients automatically.
+Setting every unit to `0` disables non-empty uploads.
+
+`history.conf` controls how many chat lines are kept (`0` = unlimited).  When
+a non-zero limit is used and a file announcement falls out of the history, the
+server also deletes that file from `files/` and removes it from `files.index`.
+With the default `history.conf` value (`0`), files are kept indefinitely.

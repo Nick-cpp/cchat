@@ -3,6 +3,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
+#include <ctype.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -27,18 +29,25 @@
 #define DELAY_CONFIG_FILE "delay.conf"
 #define KEY_CONFIG_FILE "key.conf"
 #define ANTISPAM_CONFIG_FILE "antispam.conf"
+#define FILESIZE_CONFIG_FILE "filesize.conf"
 
 #define FILE_DIR "files"
 #define FILE_INDEX "files.index"
 #define FILE_CHUNK_SIZE 2048
-#define MAX_FILE_SIZE (16LL * 1024 * 1024)
+#define DEFAULT_MAX_FILE_SIZE (16LL * 1024 * 1024)
 #define MAX_FILE_NAME 200
 #define MAX_B64_NAME 512
 
 /* history.conf: number of history entries to keep (0 = unlimited).
+   When an entry that announces a file is trimmed, that file is deleted.
+   filesize.conf: upload limit in kb/mb/gb/tb (values are added together).
    delay.conf: global delay in seconds for all users (0 = disabled).
    antispam.conf: repeat count limit for spam ban (0 = disabled). */
 #define MAX_DELAY_SECONDS 86400
+
+static long long max_file_size = DEFAULT_MAX_FILE_SIZE;
+
+static void delete_file_from_history_line(const char *line);
 
 int load_or_create_config() {
     FILE *f = fopen(CONFIG_FILE, "r");
@@ -99,6 +108,127 @@ static long long load_nonnegative_config(const char *path, long long default_val
     }
     fclose(f);
     return value;
+}
+
+static char *trim_config_token(char *text) {
+    while (*text == ' ' || *text == '\t') text++;
+
+    char *end = text + strlen(text);
+    while (end > text &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\r' || end[-1] == '\n')) {
+        *--end = '\0';
+    }
+    return text;
+}
+
+static long long units_to_file_size(long long kb, long long mb,
+                                    long long gb, long long tb) {
+    const long long values[4] = {kb, mb, gb, tb};
+    const unsigned long long multipliers[4] = {
+        1024ULL,
+        1024ULL * 1024ULL,
+        1024ULL * 1024ULL * 1024ULL,
+        1024ULL * 1024ULL * 1024ULL * 1024ULL
+    };
+
+    unsigned long long total = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned long long value = (unsigned long long)values[i];
+        if (value > (ULLONG_MAX - total) / multipliers[i]) {
+            return LLONG_MAX;
+        }
+        total += value * multipliers[i];
+    }
+
+    if (total > (unsigned long long)LLONG_MAX) {
+        return LLONG_MAX;
+    }
+    return (long long)total;
+}
+
+/* filesize.conf contains four values that are added together:
+       kb = 0
+       mb = 16
+       gb = 0
+       tb = 0
+   With the defaults above the upload limit is 16 MiB. */
+static long long load_file_size_config(void) {
+    FILE *f = fopen(FILESIZE_CONFIG_FILE, "r");
+    if (!f) {
+        f = fopen(FILESIZE_CONFIG_FILE, "w");
+        if (f) {
+            fprintf(f, "kb = 0\nmb = 16\ngb = 0\ntb = 0\n");
+            fclose(f);
+            printf("Created config file %s with default size: 16 MB\n",
+                   FILESIZE_CONFIG_FILE);
+        }
+        return DEFAULT_MAX_FILE_SIZE;
+    }
+
+    long long values[4] = {0, 0, 0, 0};
+    int recognized = 0;
+    char line[256];
+
+    while (fgets(line, sizeof(line), f)) {
+        char *entry = trim_config_token(line);
+        if (*entry == '\0' || *entry == '#') continue;
+
+        char *equals = strchr(entry, '=');
+        if (equals == NULL) {
+            printf("Ignoring invalid line in %s: %s\n",
+                   FILESIZE_CONFIG_FILE, entry);
+            continue;
+        }
+
+        *equals = '\0';
+        char *key = trim_config_token(entry);
+        char *value_text = trim_config_token(equals + 1);
+
+        char *comment = strchr(value_text, '#');
+        if (comment != NULL) {
+            *comment = '\0';
+            value_text = trim_config_token(value_text);
+        }
+
+        if (*key == '\0' || *value_text == '\0') continue;
+
+        for (char *p = key; *p; p++) {
+            *p = (char)tolower((unsigned char)*p);
+        }
+
+        char *end = NULL;
+        errno = 0;
+        long long value = strtoll(value_text, &end, 10);
+        if (errno != 0 || end == value_text || *end != '\0' || value < 0) {
+            printf("Invalid value for %s in %s: %s\n",
+                   key, FILESIZE_CONFIG_FILE, value_text);
+            continue;
+        }
+
+        int index = -1;
+        if (strcmp(key, "kb") == 0) index = 0;
+        else if (strcmp(key, "mb") == 0) index = 1;
+        else if (strcmp(key, "gb") == 0) index = 2;
+        else if (strcmp(key, "tb") == 0) index = 3;
+
+        if (index < 0) {
+            printf("Unknown key in %s: %s\n", FILESIZE_CONFIG_FILE, key);
+            continue;
+        }
+
+        values[index] = value;
+        recognized = 1;
+    }
+    fclose(f);
+
+    if (!recognized) {
+        printf("No valid entries in %s, using default size: %lld bytes\n",
+               FILESIZE_CONFIG_FILE, DEFAULT_MAX_FILE_SIZE);
+        return DEFAULT_MAX_FILE_SIZE;
+    }
+
+    return units_to_file_size(values[0], values[1], values[2], values[3]);
 }
 
 unsigned long hash_password(const char *str) {
@@ -286,6 +416,7 @@ static void trim_history(long long limit) {
 
     for (long long i = 0; i < skip; i++) {
         if (!fgets(line, sizeof(line), f)) break;
+        delete_file_from_history_line(line);
     }
     while (fgets(line, sizeof(line), f)) {
         fputs(line, tmp);
@@ -373,6 +504,74 @@ static int index_lookup(long long id, long long *size, char *name_b64,
     return found;
 }
 
+static void remove_file_index_entry(long long id) {
+    FILE *f = fopen(FILE_INDEX, "r");
+    if (f == NULL) return;
+
+    FILE *tmp = fopen(FILE_INDEX ".tmp", "w");
+    if (tmp == NULL) {
+        printf("Warning: cannot rewrite %s: %s\n",
+               FILE_INDEX, strerror(errno));
+        fclose(f);
+        return;
+    }
+
+    char line[BUFFER_SIZE];
+    int removed = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        long long file_id = 0;
+        if (sscanf(line, "%lld", &file_id) == 1 && file_id == id) {
+            removed = 1;
+            continue;
+        }
+        fputs(line, tmp);
+    }
+
+    fclose(f);
+    fclose(tmp);
+
+    if (!removed) {
+        remove(FILE_INDEX ".tmp");
+        return;
+    }
+
+    if (rename(FILE_INDEX ".tmp", FILE_INDEX) != 0) {
+        printf("Warning: cannot update %s: %s\n",
+               FILE_INDEX, strerror(errno));
+        remove(FILE_INDEX ".tmp");
+    }
+}
+
+/* Called for history lines that are about to leave the history file.  If the
+   line announces an uploaded file, the stored file and its index entry are
+   removed as well. */
+static void delete_file_from_history_line(const char *line) {
+    if (strncmp(line, "[Server]: User ", 15) != 0) return;
+
+    const char *marker = strstr(line, " uploaded file #");
+    if (marker == NULL) return;
+
+    const char *number = marker + strlen(" uploaded file #");
+    char *end = NULL;
+    errno = 0;
+    long long id = strtoll(number, &end, 10);
+    if (errno != 0 || end == number || id <= 0) return;
+    if (*end != ' ' && *end != '\r' && *end != '\n' && *end != '\0') return;
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%lld", FILE_DIR, id);
+
+    if (remove(path) != 0 && errno != ENOENT) {
+        printf("Warning: cannot delete file %s: %s\n",
+               path, strerror(errno));
+        return;
+    }
+
+    remove_file_index_entry(id);
+    printf("Deleted file #%lld because its history entry was trimmed.\n", id);
+}
+
 static void upload_close_file(upload_state *up, int remove_part) {
     if (up->fp) {
         fclose(up->fp);
@@ -404,8 +603,8 @@ static void handle_upload_begin(upload_state *up, int sd, const char *frame) {
         return;
     }
 
-    if (size < 0 || size > MAX_FILE_SIZE) {
-        upload_abort(up, sd, "file is too large");
+    if (size < 0 || size > max_file_size) {
+        upload_abort(up, sd, "file exceeds the configured size limit");
         return;
     }
 
@@ -630,6 +829,7 @@ int main() {
     long long history_limit = load_nonnegative_config(HISTORY_CONFIG_FILE, 0);
     long long delay_seconds = load_nonnegative_config(DELAY_CONFIG_FILE, 0);
     long long antispam_limit = load_nonnegative_config(ANTISPAM_CONFIG_FILE, 0);
+    max_file_size = load_file_size_config();
 
     if (delay_seconds > MAX_DELAY_SECONDS) {
         printf("Delay in %s is too large, using %d seconds.\n",
@@ -647,6 +847,7 @@ int main() {
     }
 
     printf("History limit: %lld messages (0 = unlimited)\n", history_limit);
+    printf("Max file size: %lld bytes\n", max_file_size);
     printf("Global delay: %lld seconds\n", delay_seconds);
     printf("Antispam repeat limit: %lld (0 = disabled)\n", antispam_limit);
 
@@ -725,6 +926,12 @@ int main() {
                 char delay_msg[64];
                 snprintf(delay_msg, sizeof(delay_msg), "@DELAY %lld\n", rate_limit_ms);
                 cchat_send_encrypted(new_socket, delay_msg, strlen(delay_msg));
+
+                char max_size_msg[64];
+                snprintf(max_size_msg, sizeof(max_size_msg),
+                         "@MAX_FILE_SIZE %lld\n", max_file_size);
+                cchat_send_encrypted(new_socket, max_size_msg,
+                                     strlen(max_size_msg));
 
                 if (rate_limit_ms > 0 && has_global_message) {
                     long long elapsed = monotonic_ms() - last_global_message_ms;
