@@ -2,6 +2,22 @@
 
 Chat server and client made in C.
 
+## Connecting
+
+When the client starts it shows the saved servers and these options:
+
+* Type the number of a saved server to connect to it.
+* `a` adds a new server: enter `IP:PORT` and the encryption key.  The key is
+  saved in `~/.cchat/IP:PORT` with mode `0600`, so the server appears in the
+  list next time.
+* `b` opens a direct connection: enter `IP:PORT` and the key.  These details
+  are not saved.
+* `q` quits.
+
+The username and password are requested after a server has been selected.
+Saved servers are discovered from the key files in `~/.cchat/`; non-address
+files and directories (such as `Downloads`) are ignored.
+
 ## Chat
 
 The chat fills the terminal and keeps the prompt on the bottom line.

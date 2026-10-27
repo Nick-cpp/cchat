@@ -24,6 +24,9 @@
 #define MAX_MSG_LEN 512
 #define MAX_KEY_PATH 4096
 #define MAX_CHAT_LINES 5000
+#define MAX_SAVED_SERVERS 256
+#define MAX_SERVER_NAME 128
+#define MAX_ADDRESS_LEN 128
 
 #define FILE_CHUNK_SIZE 2048
 #define DEFAULT_MAX_FILE_SIZE (16LL * 1024 * 1024)
@@ -1673,18 +1676,56 @@ static void open_download_browser(int sock) {
     free(files);
 }
 
-static int load_server_key(const char *server_ip, int port) {
+static char *trim_input(char *text) {
+    while (*text == ' ' || *text == '\t') text++;
+
+    char *end = text + strlen(text);
+    while (end > text &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\r' || end[-1] == '\n')) {
+        *--end = '\0';
+    }
+    return text;
+}
+
+static int parse_server_address(const char *input, char *ip, size_t ip_size,
+                                int *port) {
+    char copy[MAX_ADDRESS_LEN];
+    if (strlen(input) >= sizeof(copy)) return -1;
+    snprintf(copy, sizeof(copy), "%s", input);
+
+    char *colon = strrchr(copy, ':');
+    if (colon == NULL || colon == copy || colon[1] == '\0') return -1;
+
+    *colon = '\0';
+
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(colon + 1, &end, 10);
+    if (errno != 0 || end == colon + 1 || *end != '\0' ||
+        value < 1 || value > 65535) {
+        return -1;
+    }
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, copy, &addr) != 1) return -1;
+    if (strlen(copy) >= ip_size) return -1;
+
+    snprintf(ip, ip_size, "%s", copy);
+    *port = (int)value;
+    return 0;
+}
+
+static int ensure_cchat_dir(char *dir, size_t size) {
     char home[MAX_KEY_PATH];
-    char dir[MAX_KEY_PATH];
-    char path[MAX_KEY_PATH];
 
     if (get_home_dir(home, sizeof(home)) != 0) {
         printf("[Error]: Cannot determine home directory.\n");
         return -1;
     }
 
-    int n = snprintf(dir, sizeof(dir), "%s/.cchat", home);
-    if (n < 0 || (size_t)n >= sizeof(dir)) {
+    int n = snprintf(dir, size, "%s/.cchat", home);
+    if (n < 0 || (size_t)n >= size) {
         printf("[Error]: Home directory path is too long.\n");
         return -1;
     }
@@ -1701,21 +1742,65 @@ static int load_server_key(const char *server_ip, int port) {
         return -1;
     }
 
-    n = snprintf(path, sizeof(path), "%s/%s:%d", dir, server_ip, port);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
+    return 0;
+}
+
+static int build_key_path(const char *server_ip, int port,
+                          char *path, size_t size) {
+    char dir[MAX_KEY_PATH];
+
+    if (ensure_cchat_dir(dir, sizeof(dir)) != 0) return -1;
+
+    int n = snprintf(path, size, "%s/%s:%d", dir, server_ip, port);
+    if (n < 0 || (size_t)n >= size) {
         printf("[Error]: Key file path is too long.\n");
         return -1;
     }
 
-    FILE *f = fopen(path, "r");
+    return 0;
+}
+
+static int save_server_key(const char *server_ip, int port, const char *key) {
+    char path[MAX_KEY_PATH];
+    if (build_key_path(server_ip, port, path, sizeof(path)) != 0) return -1;
+
+    FILE *f = fopen(path, "w");
     if (f == NULL) {
-        printf("[Error]: Key file not found: %s\n", path);
-        printf("Create it and put the server encryption key in it.\n");
+        printf("[Error]: Cannot save key file %s: %s\n",
+               path, strerror(errno));
         return -1;
     }
 
-    char key[CHAT_KEY_MAX + 2];
-    if (fgets(key, sizeof(key), f) == NULL) {
+    int ok = fprintf(f, "%s\n", key) >= 0;
+    if (fclose(f) != 0) ok = 0;
+
+    if (!ok) {
+        printf("[Error]: Cannot write key file %s.\n", path);
+        return -1;
+    }
+
+    if (chmod(path, 0600) != 0) {
+        printf("[Warning]: Cannot restrict permissions on %s: %s\n",
+               path, strerror(errno));
+    }
+
+    printf("Saved server %s:%d to %s\n", server_ip, port, path);
+    return 0;
+}
+
+static int load_saved_server_key(const char *server_ip, int port,
+                                 char *key, size_t size) {
+    char path[MAX_KEY_PATH];
+    if (build_key_path(server_ip, port, path, sizeof(path)) != 0) return -1;
+
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        printf("[Error]: Cannot open key file %s: %s\n",
+               path, strerror(errno));
+        return -1;
+    }
+
+    if (fgets(key, (int)size, f) == NULL) {
         fclose(f);
         printf("[Error]: Key file is empty: %s\n", path);
         return -1;
@@ -1725,25 +1810,212 @@ static int load_server_key(const char *server_ip, int port) {
     key[strcspn(key, "\r\n")] = '\0';
     if (key[0] == '\0') {
         printf("[Error]: Key file is empty: %s\n", path);
-        memset(key, 0, sizeof(key));
         return -1;
     }
 
     if (strlen(key) > CHAT_KEY_MAX) {
         printf("[Error]: Key in %s is too long (max %d bytes).\n",
                path, CHAT_KEY_MAX);
-        memset(key, 0, sizeof(key));
-        return -1;
-    }
-
-    int rc = cchat_set_key(key);
-    memset(key, 0, sizeof(key));
-    if (rc != 0) {
-        printf("[Error]: Invalid key in %s.\n", path);
         return -1;
     }
 
     return 0;
+}
+
+static int prompt_server_address(char *ip, size_t ip_size, int *port) {
+    char line[MAX_ADDRESS_LEN];
+
+    for (;;) {
+        printf("Server address (IP:PORT, e.g. 127.0.0.1:8080): ");
+        fflush(stdout);
+
+        if (fgets(line, sizeof(line), stdin) == NULL) return -1;
+
+        if (strchr(line, '\n') == NULL) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+            }
+        }
+
+        line[strcspn(line, "\r\n")] = '\0';
+        char *value = trim_input(line);
+        if (*value == '\0') continue;
+
+        if (parse_server_address(value, ip, ip_size, port) == 0) return 0;
+
+        printf("Invalid address. Use IPv4:PORT, for example 127.0.0.1:8080.\n");
+    }
+}
+
+static int prompt_server_key(char *key, size_t size) {
+    char temp[CHAT_KEY_MAX + 2];
+
+    for (;;) {
+        memset(temp, 0, sizeof(temp));
+
+        if (!read_password("Enter server key: ", temp, sizeof(temp))) {
+            memset(temp, 0, sizeof(temp));
+            return -1;
+        }
+
+        if (temp[0] == '\0') {
+            printf("Key cannot be empty.\n");
+            continue;
+        }
+
+        if (strlen(temp) > CHAT_KEY_MAX) {
+            printf("Key is too long (max %d bytes).\n", CHAT_KEY_MAX);
+            memset(temp, 0, sizeof(temp));
+            continue;
+        }
+
+        snprintf(key, size, "%s", temp);
+        memset(temp, 0, sizeof(temp));
+        return 0;
+    }
+}
+
+static int compare_server_names(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+static int list_saved_servers(char names[][MAX_SERVER_NAME], int max_names) {
+    char dir[MAX_KEY_PATH];
+
+    if (ensure_cchat_dir(dir, sizeof(dir)) != 0) return 0;
+
+    DIR *d = opendir(dir);
+    if (d == NULL) return 0;
+
+    int count = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(d)) != NULL && count < max_names) {
+        if (entry->d_name[0] == '.') continue;
+        if (strlen(entry->d_name) >= MAX_SERVER_NAME) continue;
+
+        char ip[64];
+        int port;
+        if (parse_server_address(entry->d_name, ip, sizeof(ip), &port) != 0) {
+            continue;
+        }
+
+        char path[MAX_KEY_PATH];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+        snprintf(names[count], MAX_SERVER_NAME, "%s", entry->d_name);
+        count++;
+    }
+
+    closedir(d);
+
+    if (count > 1) {
+        qsort(names, (size_t)count, MAX_SERVER_NAME, compare_server_names);
+    }
+    return count;
+}
+
+static int add_saved_server(char *ip, size_t ip_size, int *port,
+                            char *key, size_t key_size) {
+    printf("\nAdd a new server\n");
+
+    if (prompt_server_address(ip, ip_size, port) != 0) return -1;
+    if (prompt_server_key(key, key_size) != 0) return -1;
+
+    if (save_server_key(ip, *port, key) != 0) {
+        memset(key, 0, key_size);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int direct_connection(char *ip, size_t ip_size, int *port,
+                             char *key, size_t key_size) {
+    printf("\nDirect connection\n");
+
+    if (prompt_server_address(ip, ip_size, port) != 0) return -1;
+    if (prompt_server_key(key, key_size) != 0) return -1;
+
+    return 0;
+}
+
+static int choose_server(char *ip, size_t ip_size, int *port,
+                         char *key, size_t key_size) {
+    char names[MAX_SAVED_SERVERS][MAX_SERVER_NAME];
+
+    for (;;) {
+        int count = list_saved_servers(names, MAX_SAVED_SERVERS);
+
+        printf("\n=== cchat servers ===\n");
+        if (count == 0) {
+            printf("No saved servers.\n");
+        } else {
+            printf("Saved servers:\n");
+            for (int i = 0; i < count; i++) {
+                printf("  %d) %s\n", i + 1, names[i]);
+            }
+        }
+
+        printf("  a) Add a new server\n");
+        printf("  b) Direct connection\n");
+        printf("  q) Quit\n");
+        printf("Choose: ");
+        fflush(stdout);
+
+        char line[64];
+        if (fgets(line, sizeof(line), stdin) == NULL) return -1;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        char *choice = trim_input(line);
+        if (*choice == '\0') continue;
+
+        if (strcasecmp(choice, "a") == 0) {
+            if (add_saved_server(ip, ip_size, port, key, key_size) == 0) {
+                return 0;
+            }
+            continue;
+        }
+
+        if (strcasecmp(choice, "b") == 0) {
+            if (direct_connection(ip, ip_size, port, key, key_size) == 0) {
+                return 0;
+            }
+            continue;
+        }
+
+        if (strcasecmp(choice, "q") == 0) return -1;
+
+        char *end = NULL;
+        errno = 0;
+        long number = strtol(choice, &end, 10);
+        if (errno == 0 && end != choice && *end == '\0' &&
+            number >= 1 && number <= count) {
+            char saved_ip[64];
+            int saved_port;
+
+            if (parse_server_address(names[number - 1], saved_ip,
+                                     sizeof(saved_ip), &saved_port) != 0) {
+                printf("Invalid saved server entry.\n");
+                continue;
+            }
+
+            if (load_saved_server_key(saved_ip, saved_port,
+                                      key, key_size) != 0) {
+                continue;
+            }
+
+            snprintf(ip, ip_size, "%s", saved_ip);
+            *port = saved_port;
+            return 0;
+        }
+
+        printf("Invalid choice.\n");
+    }
 }
 
 static void load_history_into_buffer(int sock) {
@@ -1797,51 +2069,52 @@ int main(void) {
     struct sockaddr_in serv_addr;
     pthread_t recv_thread;
     char server_ip[64];
-    char address_input[128];
-    int port;
+    int port = 0;
+    char server_key[CHAT_KEY_MAX + 2];
 
     install_cleanup_handlers();
     init_download_dir();
 
-    printf("Enter server address (e.g., 127.0.0.1:8080): ");
-    if (scanf("%127s", address_input) != 1) return 1;
-    while (getchar() != '\n');
+    for (;;) {
+        memset(server_key, 0, sizeof(server_key));
 
-    char *colon = strrchr(address_input, ':');
-    if (colon == NULL) {
-        printf("Invalid format. Please use IP:PORT (e.g., 127.0.0.1:8080)\n");
-        return -1;
-    }
+        if (choose_server(server_ip, sizeof(server_ip), &port,
+                          server_key, sizeof(server_key)) != 0) {
+            return 0;
+        }
 
-    *colon = '\0';
-    snprintf(server_ip, sizeof(server_ip), "%s", address_input);
-    port = atoi(colon + 1);
+        if (cchat_set_key(server_key) != 0) {
+            printf("[Error]: Invalid key for %s:%d.\n", server_ip, port);
+            memset(server_key, 0, sizeof(server_key));
+            continue;
+        }
+        memset(server_key, 0, sizeof(server_key));
 
-    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        printf("Invalid address / Address not supported\n");
-        return -1;
-    }
+        memset(&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(port);
 
-    if (port <= 0 || port > 65535) {
-        printf("Invalid port\n");
-        return -1;
-    }
+        if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
+            printf("Invalid address / Address not supported\n");
+            continue;
+        }
 
-    if (load_server_key(server_ip, port) != 0) {
-        return 1;
-    }
+        if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            printf("Socket creation error\n");
+            return -1;
+        }
 
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        printf("Socket creation error\n");
-        return -1;
-    }
+        printf("Connecting to %s:%d...\n", server_ip, port);
+        fflush(stdout);
 
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
+        if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            printf("Connection failed: %s\n", strerror(errno));
+            close(sock);
+            sock = 0;
+            continue;
+        }
 
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        printf("Connection failed\n");
-        return -1;
+        break;
     }
 
     int choice = 0;
@@ -1857,6 +2130,11 @@ int main(void) {
     memset(current_username, 0, MAX_USER_LEN);
     printf("Enter username (max 9 characters): ");
     if (fgets(current_username, MAX_USER_LEN, stdin) != NULL) {
+        if (strchr(current_username, '\n') == NULL) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+            }
+        }
         current_username[strcspn(current_username, "\r\n")] = 0;
     }
 
