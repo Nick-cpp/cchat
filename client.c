@@ -28,6 +28,10 @@
 #define MAX_SERVER_NAME 128
 #define MAX_ADDRESS_LEN 128
 
+/* The client sends a heartbeat so idle connections are not dropped by NAT
+   or firewalls.  It is invisible: the server only replies with @PONG. */
+#define PING_INTERVAL_MS 20000
+
 #define FILE_CHUNK_SIZE 2048
 #define DEFAULT_MAX_FILE_SIZE (16LL * 1024 * 1024)
 #define MAX_B64_NAME 512
@@ -195,6 +199,23 @@ static int client_send(int sock, const void *data, size_t len) {
     int rc = cchat_send_encrypted(sock, data, len);
     pthread_mutex_unlock(&send_lock);
     return rc;
+}
+
+/* Runs for the whole session.  Pings only keep the connection alive; a failed
+   send is ignored and never disconnects an inactive user. */
+static void *send_heartbeats(void *socket_desc) {
+    int sock = *(int *)socket_desc;
+    const char ping_frame[] = "@PING\n";
+
+    for (;;) {
+        for (int i = 0; i < PING_INTERVAL_MS / 100 && is_running; i++) {
+            usleep(100000);
+        }
+        if (!is_running) break;
+
+        client_send(sock, ping_frame, sizeof(ping_frame) - 1);
+    }
+    return NULL;
 }
 
 static size_t display_columns(const char *text, size_t len) {
@@ -750,11 +771,7 @@ void *receive_messages(void *socket_desc) {
 
         if (handle_file_frame(buffer)) continue;
 
-        if (strncmp(buffer, "@PING", 5) == 0) {
-            const char pong_frame[] = "@PONG\n";
-            client_send(sock, pong_frame, sizeof(pong_frame) - 1);
-            continue;
-        }
+        if (strncmp(buffer, "@PONG", 5) == 0) continue;
 
         if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
             long long size = atoll(buffer + 15);
@@ -2047,11 +2064,7 @@ static void load_history_into_buffer(int sock) {
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
 
-        if (strncmp(buffer, "@PING", 5) == 0) {
-            const char pong_frame[] = "@PONG\n";
-            client_send(sock, pong_frame, sizeof(pong_frame) - 1);
-            continue;
-        }
+        if (strncmp(buffer, "@PONG", 5) == 0) continue;
 
         if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
             long long size = atoll(buffer + 15);
@@ -2242,6 +2255,12 @@ int main(void) {
         perror("Failed to create thread");
         close(sock);
         return 1;
+    }
+
+    pthread_t heartbeat_thread;
+    if (pthread_create(&heartbeat_thread, NULL, send_heartbeats,
+                       (void*)&sock) == 0) {
+        pthread_detach(heartbeat_thread);
     }
 
     chat_loop(sock);

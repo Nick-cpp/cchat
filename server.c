@@ -45,11 +45,6 @@
    antispam.conf: repeat count limit for spam ban (0 = disabled). */
 #define MAX_DELAY_SECONDS 86400
 
-/* Heartbeat: how often an idle connection gets a @PING control frame.
-   Clients answer with @PONG.  This only keeps the connection alive; it is
-   never used to disconnect an inactive client. */
-#define PING_INTERVAL_MS 20000
-
 static long long max_file_size = DEFAULT_MAX_FILE_SIZE;
 
 static void delete_file_from_history_line(const char *line);
@@ -818,9 +813,11 @@ static int handle_control_frame(int slot, int sd, const char *frame,
         handle_file_get(sd, atoll(frame + 10));
         return 1;
     }
-    /* Heartbeat replies are intentionally ignored: they are not messages,
-       are never saved to history, and never disconnect the client. */
-    if (strncmp(frame, "@PONG", 5) == 0) {
+    /* Client heartbeat: answer with @PONG.  Neither frame is a chat message,
+       so nothing is saved to history or broadcast to other clients. */
+    if (strncmp(frame, "@PING", 5) == 0) {
+        const char pong_frame[] = "@PONG\n";
+        cchat_send_encrypted(sd, pong_frame, sizeof(pong_frame) - 1);
         return 1;
     }
     return 0;
@@ -867,7 +864,6 @@ int main() {
     char client_last_message[MAX_CLIENTS][BUFFER_SIZE];
     long long last_global_message_ms = 0;
     int has_global_message = 0;
-    long long next_ping_ms = monotonic_ms() + PING_INTERVAL_MS;
     int client_repeat_count[MAX_CLIENTS];
     int addrlen;
     struct sockaddr_in address;
@@ -917,32 +913,9 @@ int main() {
             if (sd > max_sd) max_sd = sd;
         }
 
-        long long now_ms = monotonic_ms();
-        long long wait_ms = next_ping_ms - now_ms;
-        if (wait_ms < 0) wait_ms = 0;
-
-        struct timeval select_timeout;
-        select_timeout.tv_sec = wait_ms / 1000;
-        select_timeout.tv_usec = (wait_ms % 1000) * 1000;
-
-        activity = select(max_sd + 1, &readfds, NULL, NULL,
-                          &select_timeout);
-        if (activity < 0) {
-            if (errno == EINTR) continue;
+        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+        if ((activity < 0) && (errno != EINTR)) {
             printf("Select error\n");
-            continue;
-        }
-
-        if (monotonic_ms() >= next_ping_ms) {
-            const char ping_frame[] = "@PING\n";
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                int cs = client_sockets[i];
-                if (cs != 0) {
-                    cchat_send_encrypted(cs, ping_frame,
-                                         strlen(ping_frame));
-                }
-            }
-            next_ping_ms = monotonic_ms() + PING_INTERVAL_MS;
         }
 
         if (FD_ISSET(server_fd, &readfds)) {

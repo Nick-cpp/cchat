@@ -30,10 +30,11 @@ The chat fills the terminal and keeps the prompt on the bottom line.
   the screen.
 * `Ctrl-C` quits. The client keeps the most recent 5000 chat lines in memory.
 
-The server sends a small `@PING` heartbeat to every client.  Clients answer
-with `@PONG`, which keeps idle connections from being dropped by NAT or
-firewalls.  Heartbeats never appear in the chat and are not saved to history.
-There is no idle timeout: an inactive user stays connected indefinitely.
+Every 20 seconds the client sends a small `@PING` heartbeat to the server,
+which answers with `@PONG`.  This keeps idle connections from being dropped
+by NAT or firewalls.  Heartbeats never appear in the chat and are not saved to
+history.  There is no idle timeout: an inactive user stays connected
+indefinitely.
 
 ## File transfers
 
