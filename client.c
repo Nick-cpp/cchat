@@ -29,8 +29,11 @@
 #define MAX_ADDRESS_LEN 128
 
 /* The client sends a heartbeat so idle connections are not dropped by NAT
-   or firewalls.  It is invisible: the server only replies with @PONG. */
+   or firewalls.  It is invisible: the server only replies with @PONG.  If the
+   server stops answering, the connection is considered lost after three
+   missed heartbeats. */
 #define PING_INTERVAL_MS 20000
+#define PONG_TIMEOUT_MS (3 * PING_INTERVAL_MS)
 
 #define FILE_CHUNK_SIZE 2048
 #define DEFAULT_MAX_FILE_SIZE (16LL * 1024 * 1024)
@@ -66,6 +69,8 @@ typedef struct {
 } chat_line;
 
 static volatile sig_atomic_t is_running = 1;
+static volatile sig_atomic_t connection_lost = 0;
+static volatile long long last_pong_ms = 0;
 char current_username[MAX_USER_LEN];
 
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -201,19 +206,31 @@ static int client_send(int sock, const void *data, size_t len) {
     return rc;
 }
 
-/* Runs for the whole session.  Pings only keep the connection alive; a failed
-   send is ignored and never disconnects an inactive user. */
+/* Runs for the whole session.  Pings keep the connection alive and let the
+   client notice a dead server: if no @PONG arrives for PONG_TIMEOUT_MS, the
+   session is stopped with a "connection lost" message. */
 static void *send_heartbeats(void *socket_desc) {
     int sock = *(int *)socket_desc;
     const char ping_frame[] = "@PING\n";
+    long long next_ping_ms = monotonic_ms() + PING_INTERVAL_MS;
 
-    for (;;) {
-        for (int i = 0; i < PING_INTERVAL_MS / 100 && is_running; i++) {
-            usleep(100000);
-        }
+    last_pong_ms = monotonic_ms();
+
+    while (is_running) {
+        usleep(100000);
         if (!is_running) break;
 
-        client_send(sock, ping_frame, sizeof(ping_frame) - 1);
+        long long now = monotonic_ms();
+        if (now - last_pong_ms > PONG_TIMEOUT_MS) {
+            connection_lost = 1;
+            is_running = 0;
+            break;
+        }
+
+        if (now >= next_ping_ms) {
+            client_send(sock, ping_frame, sizeof(ping_frame) - 1);
+            next_ping_ms = now + PING_INTERVAL_MS;
+        }
     }
     return NULL;
 }
@@ -766,12 +783,21 @@ void *receive_messages(void *socket_desc) {
 
     while (is_running) {
         int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
-        if (rc <= 0) break;
+        if (rc <= 0) {
+            if (is_running) {
+                connection_lost = 1;
+                is_running = 0;
+            }
+            break;
+        }
         buffer[bytes_received] = '\0';
 
         if (handle_file_frame(buffer)) continue;
 
-        if (strncmp(buffer, "@PONG", 5) == 0) continue;
+        if (strncmp(buffer, "@PONG", 5) == 0) {
+            last_pong_ms = monotonic_ms();
+            continue;
+        }
 
         if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
             long long size = atoll(buffer + 15);
@@ -1063,6 +1089,7 @@ static void chat_loop(int sock) {
             pthread_mutex_unlock(&output_lock);
 
             if (client_send(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
+                connection_lost = 1;
                 is_running = 0;
                 break;
             }
@@ -1349,6 +1376,7 @@ static void send_file_path(int sock, const char *path) {
              (long long)st.st_size, name_b64);
     if (client_send(sock, line, strlen(line)) <= 0) {
         fclose(f);
+        connection_lost = 1;
         is_running = 0;
         return;
     }
@@ -1361,6 +1389,7 @@ static void send_file_path(int sock, const char *path) {
         snprintf(line, sizeof(line), "@UPLOAD_DATA %s\n", encoded);
         if (client_send(sock, line, strlen(line)) <= 0) {
             fclose(f);
+            connection_lost = 1;
             is_running = 0;
             return;
         }
@@ -1369,6 +1398,7 @@ static void send_file_path(int sock, const char *path) {
 
     const char *end = "@UPLOAD_END\n";
     if (client_send(sock, end, strlen(end)) <= 0) {
+        connection_lost = 1;
         is_running = 0;
     }
 }
@@ -1557,6 +1587,7 @@ static void request_file_list(int sock) {
 
     const char *msg = "@FILE_LIST\n";
     if (client_send(sock, msg, strlen(msg)) <= 0) {
+        connection_lost = 1;
         is_running = 0;
         return;
     }
@@ -1626,6 +1657,7 @@ static void request_download(int sock, long long id) {
     char msg[64];
     snprintf(msg, sizeof(msg), "@FILE_GET %lld\n", id);
     if (client_send(sock, msg, strlen(msg)) <= 0) {
+        connection_lost = 1;
         is_running = 0;
     }
 }
@@ -2272,6 +2304,12 @@ int main(void) {
     pthread_mutex_unlock(&output_lock);
 
     restore_terminal();
+
+    if (connection_lost) {
+        printf("[!] Connection lost: the server stopped responding.\n");
+        fflush(stdout);
+    }
+
     close(sock);
     return 0;
 }

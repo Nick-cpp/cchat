@@ -34,7 +34,9 @@ Every 20 seconds the client sends a small `@PING` heartbeat to the server,
 which answers with `@PONG`.  This keeps idle connections from being dropped
 by NAT or firewalls.  Heartbeats never appear in the chat and are not saved to
 history.  There is no idle timeout: an inactive user stays connected
-indefinitely.
+indefinitely as long as the server keeps answering.  If no `@PONG` arrives for
+about a minute (three missed heartbeats), the client disconnects and reports
+that the connection was lost.
 
 ## File transfers
 
