@@ -65,6 +65,7 @@ static volatile sig_atomic_t is_running = 1;
 char current_username[MAX_USER_LEN];
 
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 static char input_line[BUFFER_SIZE];
 static size_t input_line_len = 0;
 static char last_sent_message[BUFFER_SIZE];
@@ -185,6 +186,15 @@ static long long monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Every frame must be written as one length-prefixed unit.  The receive
+   thread answers heartbeats, so sends from both threads are serialized. */
+static int client_send(int sock, const void *data, size_t len) {
+    pthread_mutex_lock(&send_lock);
+    int rc = cchat_send_encrypted(sock, data, len);
+    pthread_mutex_unlock(&send_lock);
+    return rc;
 }
 
 static size_t display_columns(const char *text, size_t len) {
@@ -740,6 +750,12 @@ void *receive_messages(void *socket_desc) {
 
         if (handle_file_frame(buffer)) continue;
 
+        if (strncmp(buffer, "@PING", 5) == 0) {
+            const char pong_frame[] = "@PONG\n";
+            client_send(sock, pong_frame, sizeof(pong_frame) - 1);
+            continue;
+        }
+
         if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
             long long size = atoll(buffer + 15);
             if (size >= 0) {
@@ -1029,7 +1045,7 @@ static void chat_loop(int sock) {
             output_text_locked(formatted_msg, strlen(formatted_msg));
             pthread_mutex_unlock(&output_lock);
 
-            if (cchat_send_encrypted(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
+            if (client_send(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
                 is_running = 0;
                 break;
             }
@@ -1314,7 +1330,7 @@ static void send_file_path(int sock, const char *path) {
     char line[BUFFER_SIZE];
     snprintf(line, sizeof(line), "@UPLOAD_BEGIN %lld %s\n",
              (long long)st.st_size, name_b64);
-    if (cchat_send_encrypted(sock, line, strlen(line)) <= 0) {
+    if (client_send(sock, line, strlen(line)) <= 0) {
         fclose(f);
         is_running = 0;
         return;
@@ -1326,7 +1342,7 @@ static void send_file_path(int sock, const char *path) {
     while ((n = fread(data, 1, sizeof(data), f)) > 0) {
         if (cchat_b64_encode(data, n, encoded, sizeof(encoded)) < 0) break;
         snprintf(line, sizeof(line), "@UPLOAD_DATA %s\n", encoded);
-        if (cchat_send_encrypted(sock, line, strlen(line)) <= 0) {
+        if (client_send(sock, line, strlen(line)) <= 0) {
             fclose(f);
             is_running = 0;
             return;
@@ -1335,7 +1351,7 @@ static void send_file_path(int sock, const char *path) {
     fclose(f);
 
     const char *end = "@UPLOAD_END\n";
-    if (cchat_send_encrypted(sock, end, strlen(end)) <= 0) {
+    if (client_send(sock, end, strlen(end)) <= 0) {
         is_running = 0;
     }
 }
@@ -1523,7 +1539,7 @@ static void request_file_list(int sock) {
     pthread_mutex_unlock(&file_lock);
 
     const char *msg = "@FILE_LIST\n";
-    if (cchat_send_encrypted(sock, msg, strlen(msg)) <= 0) {
+    if (client_send(sock, msg, strlen(msg)) <= 0) {
         is_running = 0;
         return;
     }
@@ -1592,7 +1608,7 @@ static void request_download(int sock, long long id) {
 
     char msg[64];
     snprintf(msg, sizeof(msg), "@FILE_GET %lld\n", id);
-    if (cchat_send_encrypted(sock, msg, strlen(msg)) <= 0) {
+    if (client_send(sock, msg, strlen(msg)) <= 0) {
         is_running = 0;
     }
 }
@@ -2031,6 +2047,12 @@ static void load_history_into_buffer(int sock) {
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
 
+        if (strncmp(buffer, "@PING", 5) == 0) {
+            const char pong_frame[] = "@PONG\n";
+            client_send(sock, pong_frame, sizeof(pong_frame) - 1);
+            continue;
+        }
+
         if (strncmp(buffer, "@MAX_FILE_SIZE ", 15) == 0) {
             long long size = atoll(buffer + 15);
             if (size >= 0) max_file_size = size;
@@ -2173,7 +2195,7 @@ int main(void) {
     memcpy(auth_data + sizeof(int), current_username, MAX_USER_LEN);
     memcpy(auth_data + sizeof(int) + MAX_USER_LEN, password, MAX_PASS_LEN);
 
-    if (cchat_send_encrypted(sock, auth_data, sizeof(auth_data)) <= 0) {
+    if (client_send(sock, auth_data, sizeof(auth_data)) <= 0) {
         perror("Failed to send credentials");
         close(sock);
         return 1;
