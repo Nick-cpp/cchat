@@ -1951,7 +1951,6 @@ static int choose_server(char *ip, size_t ip_size, int *port,
     for (;;) {
         int count = list_saved_servers(names, MAX_SAVED_SERVERS);
 
-        printf("\n=== cchat servers ===\n");
         if (count == 0) {
             printf("No saved servers.\n");
         } else {
