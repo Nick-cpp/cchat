@@ -4,6 +4,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <termios.h>
 #include <time.h>
@@ -19,8 +20,6 @@
 #include "crypto.h"
 
 #define BUFFER_SIZE 4096
-#define MAX_USER_LEN 10
-#define MAX_PASS_LEN 64
 #define MAX_MSG_LEN 512
 #define MAX_KEY_PATH 4096
 #define MAX_CHAT_LINES 5000
@@ -45,7 +44,7 @@
 typedef struct {
     long long id;
     long long size;
-    char uploader[MAX_USER_LEN];
+    char *uploader;
     char name[256];
 } remote_file_info;
 
@@ -71,7 +70,7 @@ typedef struct {
 static volatile sig_atomic_t is_running = 1;
 static volatile sig_atomic_t connection_lost = 0;
 static volatile long long last_pong_ms = 0;
-char current_username[MAX_USER_LEN];
+char *current_username = NULL;
 
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -82,6 +81,8 @@ static size_t last_sent_len = 0;
 static long long cooldown_until_ms = 0;
 static long long global_delay_ms = 0;
 static long long max_file_size = DEFAULT_MAX_FILE_SIZE;
+static size_t server_max_username = 10;
+static size_t server_max_password = 64;
 
 static pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 static remote_file_info remote_files[MAX_REMOTE_FILES];
@@ -101,6 +102,7 @@ static void request_file_list(int sock);
 static void request_download(int sock, long long id);
 static void open_upload_manager(int sock);
 static void open_download_browser(int sock);
+static void format_file_size(long long size, char *out, size_t cap);
 
 static struct termios saved_termios;
 static volatile sig_atomic_t terminal_is_raw = 0;
@@ -191,10 +193,117 @@ static int read_password(const char *prompt, char *password, size_t size) {
     return 1;
 }
 
+/* The username length limit is provided by the server (@LIMITS). */
+static int prompt_username(char *out, size_t size, size_t max_len) {
+    if (max_len < 1 || max_len > SIZE_MAX - 2 ||
+        max_len > (size_t)INT_MAX - 2) return 0;
+
+    size_t line_size = max_len + 2;
+    char *line = malloc(line_size);
+    if (line == NULL) return 0;
+
+    for (;;) {
+        printf("Enter username (max %zu characters): ", max_len);
+        fflush(stdout);
+
+        if (fgets(line, (int)line_size, stdin) == NULL) {
+            free(line);
+            return 0;
+        }
+
+        int complete_line = strchr(line, '\n') != NULL;
+        if (!complete_line) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+            }
+        }
+
+        line[strcspn(line, "\r\n")] = '\0';
+        size_t len = strlen(line);
+
+        if (len == 0) {
+            printf("[Error]: Username cannot be empty.\n");
+            continue;
+        }
+        if (!complete_line || len > max_len) {
+            printf("[Error]: Username is too long (max %zu characters).\n",
+                   max_len);
+            continue;
+        }
+
+        snprintf(out, size, "%s", line);
+        free(line);
+        return 1;
+    }
+}
+
+/* Reads a password, re-prompting when it exceeds the server's limit. */
+static int read_server_password(const char *label, char *password, size_t size,
+                                size_t max_len) {
+    if (max_len < 1 || max_len > SIZE_MAX - 2 || max_len > (size_t)INT_MAX - 2) {
+        return 0;
+    }
+
+    size_t temp_size = max_len + 2;
+    char *temp = malloc(temp_size);
+    if (temp == NULL) return 0;
+
+    char prompt[192];
+
+    for (;;) {
+        memset(temp, 0, temp_size);
+        snprintf(prompt, sizeof(prompt), "%s (max %zu characters): ",
+                 label, max_len);
+
+        if (!read_password(prompt, temp, temp_size)) {
+            memset(temp, 0, temp_size);
+            free(temp);
+            return 0;
+        }
+
+        if (strlen(temp) > max_len) {
+            printf("[Error]: Password is too long (max %zu characters).\n",
+                   max_len);
+            continue;
+        }
+
+        snprintf(password, size, "%s", temp);
+        memset(temp, 0, temp_size);
+        free(temp);
+        return 1;
+    }
+}
+
 static long long monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* The server sends the configurable account limits before authentication. */
+static int read_server_limits(int sock) {
+    char buffer[128];
+    size_t len = 0;
+
+    if (cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &len) != 1) {
+        return -1;
+    }
+    buffer[len] = '\0';
+
+    unsigned long long user_limit = 0;
+    unsigned long long pass_limit = 0;
+    if (sscanf(buffer, "@LIMITS %llu %llu", &user_limit, &pass_limit) != 2) {
+        return -1;
+    }
+
+    if (user_limit < 1 || user_limit > (unsigned long long)SIZE_MAX ||
+        pass_limit < 1 || pass_limit > (unsigned long long)SIZE_MAX) {
+        return -1;
+    }
+
+    server_max_username = (size_t)user_limit;
+    server_max_password = (size_t)pass_limit;
+    return 0;
 }
 
 /* Every frame must be written as one length-prefixed unit.  The receive
@@ -284,6 +393,143 @@ static void print_limited_columns(const char *text, size_t max_columns) {
     }
 }
 
+typedef struct {
+    int line_index;
+    size_t offset;
+    size_t length;
+} visual_row;
+
+/* Splits one line into a display row.  The break is made at the last space
+   that fits, and a word longer than the terminal is split by force. */
+static int next_visual_segment(const char *text, size_t len, size_t pos,
+                               int max_cols, size_t *row_len,
+                               size_t *next_pos) {
+    if (pos >= len) return 0;
+
+    size_t end = pos;
+    size_t columns = 0;
+    size_t last_space = (size_t)-1;
+
+    while (end < len && columns < (size_t)max_cols) {
+        size_t n = utf8_char_len(text + end, len - end);
+        if (text[end] == ' ') last_space = end;
+        end += n;
+        columns++;
+    }
+
+    size_t row_end = end;
+    size_t next = end;
+
+    if (end < len && last_space != (size_t)-1 && last_space > pos) {
+        /* Move a whole word to the next row, but do not leave the current
+           row mostly empty when that word cannot fit on a row anyway. */
+        size_t word_end = last_space + 1;
+        size_t word_columns = 0;
+        while (word_end < len && text[word_end] != ' ') {
+            word_end += utf8_char_len(text + word_end, len - word_end);
+            word_columns++;
+        }
+
+        if (word_columns <= (size_t)max_cols) {
+            row_end = last_space;
+            next = last_space + 1;
+        }
+    }
+
+    while (row_end > pos && text[row_end - 1] == ' ') row_end--;
+    while (next < len && text[next] == ' ') next++;
+
+    if (next <= pos) {
+        next = end > pos ? end : pos + utf8_char_len(text + pos, len - pos);
+    }
+    if (row_end <= pos) {
+        row_end = end > pos ? end : next;
+        if (next <= pos) next = row_end;
+    }
+
+    *row_len = row_end - pos;
+    *next_pos = next;
+    return 1;
+}
+
+static int wrapped_row_count(const char *text, int max_cols) {
+    size_t len = strlen(text);
+    size_t pos = 0;
+    int rows = 0;
+
+    while (pos < len) {
+        size_t row_len = 0;
+        size_t next = 0;
+        if (!next_visual_segment(text, len, pos, max_cols,
+                                 &row_len, &next)) {
+            break;
+        }
+        rows++;
+        if (next <= pos) break;
+        pos = next;
+    }
+
+    return rows > 0 ? rows : 1;
+}
+
+static int chat_visual_row_count(int max_cols) {
+    int total = 0;
+    for (int i = 0; i < chat_line_count; i++) {
+        total += wrapped_row_count(chat_lines[i].text, max_cols);
+    }
+    return total;
+}
+
+/* Builds the list of display rows for the current terminal width. */
+static visual_row *build_visual_rows(int max_cols, int *count_out) {
+    int capacity = 256;
+    int count = 0;
+    visual_row *rows = malloc((size_t)capacity * sizeof(*rows));
+    if (rows == NULL) {
+        *count_out = 0;
+        return NULL;
+    }
+
+    for (int i = 0; i < chat_line_count; i++) {
+        const char *text = chat_lines[i].text;
+        size_t len = strlen(text);
+        size_t pos = 0;
+
+        while (pos < len) {
+            size_t row_len = 0;
+            size_t next = 0;
+            if (!next_visual_segment(text, len, pos, max_cols,
+                                     &row_len, &next)) {
+                break;
+            }
+
+            if (count == capacity) {
+                int new_capacity = capacity * 2;
+                visual_row *tmp = realloc(rows,
+                                          (size_t)new_capacity * sizeof(*rows));
+                if (tmp == NULL) {
+                    free(rows);
+                    *count_out = 0;
+                    return NULL;
+                }
+                rows = tmp;
+                capacity = new_capacity;
+            }
+
+            rows[count].line_index = i;
+            rows[count].offset = pos;
+            rows[count].length = row_len;
+            count++;
+
+            if (next <= pos) break;
+            pos = next;
+        }
+    }
+
+    *count_out = count;
+    return rows;
+}
+
 static void append_one_chat_line_locked(const char *text, size_t len) {
     if (len == 0) return;
 
@@ -312,11 +558,16 @@ static void append_one_chat_line_locked(const char *text, size_t len) {
     }
 
     if (chat_line_count >= MAX_CHAT_LINES) {
+        int removed_rows = wrapped_row_count(chat_lines[0].text,
+                                              terminal_columns());
         free(chat_lines[0].text);
         memmove(&chat_lines[0], &chat_lines[1],
                 (size_t)(chat_line_count - 1) * sizeof(chat_lines[0]));
         chat_line_count--;
-        if (chat_scroll_back > 0) chat_scroll_back--;
+        if (chat_scroll_back > 0) {
+            chat_scroll_back -= removed_rows;
+            if (chat_scroll_back < 0) chat_scroll_back = 0;
+        }
     }
 
     if (chat_line_count == chat_line_capacity) {
@@ -334,7 +585,9 @@ static void append_one_chat_line_locked(const char *text, size_t len) {
     }
 
     chat_lines[chat_line_count++].text = line;
-    if (chat_scroll_back > 0) chat_scroll_back++;
+    if (chat_scroll_back > 0) {
+        chat_scroll_back += wrapped_row_count(line, terminal_columns());
+    }
 }
 
 static void append_chat_line_locked(const char *text, size_t len) {
@@ -357,16 +610,21 @@ static void append_chat_line_locked(const char *text, size_t len) {
 static void draw_prompt_locked(void) {
     int rows = terminal_rows();
     int cols = terminal_columns();
+    int prompt_row = rows > 1 ? rows - 1 : 1;
 
-    char prompt[128];
+    const char *username = current_username != NULL ? current_username : "";
+    size_t prompt_cap = strlen(username) + 64;
+    char *prompt = malloc(prompt_cap);
+    if (prompt == NULL) return;
+
     if (chat_scroll_back > 0) {
-        snprintf(prompt, sizeof(prompt), "[%s] (scroll %d): ",
-                 current_username, chat_scroll_back);
+        snprintf(prompt, prompt_cap, "[%s] (scroll %d): ",
+                 username, chat_scroll_back);
     } else {
-        snprintf(prompt, sizeof(prompt), "[%s]: ", current_username);
+        snprintf(prompt, prompt_cap, "[%s]: ", username);
     }
 
-    printf("\33[%d;1H\33[2K%s", rows, prompt);
+    printf("\33[%d;1H\33[2K%s", prompt_row, prompt);
 
     size_t prompt_columns = display_columns(prompt, strlen(prompt));
     size_t available = prompt_columns < (size_t)cols
@@ -388,32 +646,75 @@ static void draw_prompt_locked(void) {
         fwrite(input_line + start, 1, input_line_len - start, stdout);
     }
     fflush(stdout);
+    free(prompt);
+}
+
+/* The bottom line always shows the server's current delay and upload limit.
+   A limit of zero means the server rejected all file uploads. */
+static void draw_status_bar_locked(void) {
+    int rows = terminal_rows();
+    int cols = terminal_columns();
+
+    char delay_text[64];
+    if (global_delay_ms <= 0) {
+        snprintf(delay_text, sizeof(delay_text), "off");
+    } else if (global_delay_ms % 1000 == 0) {
+        snprintf(delay_text, sizeof(delay_text), "%lld s",
+                 global_delay_ms / 1000);
+    } else {
+        snprintf(delay_text, sizeof(delay_text), "%.1f s",
+                 global_delay_ms / 1000.0);
+    }
+
+    char file_text[64];
+    if (max_file_size <= 0) {
+        snprintf(file_text, sizeof(file_text), "uploads disabled");
+    } else {
+        format_file_size(max_file_size, file_text, sizeof(file_text));
+    }
+
+    char status[192];
+    snprintf(status, sizeof(status), " Server delay: %s | Max file: %s ",
+             delay_text, file_text);
+
+    printf("\33[%d;1H\33[2K\33[7m", rows);
+    print_limited_columns(status, (size_t)cols);
+    fputs("\33[0m", stdout);
+    fflush(stdout);
 }
 
 static void redraw_chat_locked(void) {
     int rows = terminal_rows();
     int cols = terminal_columns();
-    int chat_rows = rows - 1;
+    int chat_rows = rows - 2;
     if (chat_rows < 1) chat_rows = 1;
 
-    int max_back = chat_line_count - chat_rows;
+    int visual_count = 0;
+    visual_row *visual = build_visual_rows(cols, &visual_count);
+
+    int max_back = visual_count - chat_rows;
     if (max_back < 0) max_back = 0;
     if (chat_scroll_back > max_back) chat_scroll_back = max_back;
     if (chat_scroll_back < 0) chat_scroll_back = 0;
 
-    int start = chat_line_count - chat_rows - chat_scroll_back;
+    int start = visual_count - chat_rows - chat_scroll_back;
     if (start < 0) start = 0;
 
     fputs("\33[H\33[2J", stdout);
     for (int i = 0; i < chat_rows; i++) {
         int idx = start + i;
-        if (idx >= 0 && idx < chat_line_count) {
-            print_limited_columns(chat_lines[idx].text, (size_t)cols);
+        if (visual != NULL && idx >= 0 && idx < visual_count) {
+            const visual_row *row = &visual[idx];
+            const char *text = chat_lines[row->line_index].text;
+            fwrite(text + row->offset, 1, row->length, stdout);
         }
         fputs("\33[K\n", stdout);
     }
     draw_prompt_locked();
+    draw_status_bar_locked();
     fflush(stdout);
+
+    free(visual);
 }
 
 /* Adds text to the chat log and redraws the visible viewport.  While a
@@ -426,10 +727,11 @@ static void output_text_locked(const char *text, size_t len) {
 
 static void scroll_chat_locked(int delta) {
     int rows = terminal_rows();
-    int chat_rows = rows - 1;
+    int cols = terminal_columns();
+    int chat_rows = rows - 2;
     if (chat_rows < 1) chat_rows = 1;
 
-    int max_back = chat_line_count - chat_rows;
+    int max_back = chat_visual_row_count(cols) - chat_rows;
     if (max_back < 0) max_back = 0;
 
     int next = chat_scroll_back + delta;
@@ -444,7 +746,7 @@ static void scroll_chat_locked(int delta) {
 
 static void scroll_chat_pages_locked(int pages) {
     int rows = terminal_rows();
-    int chat_rows = rows - 1;
+    int chat_rows = rows - 2;
     if (chat_rows < 1) chat_rows = 1;
     scroll_chat_locked(pages * chat_rows);
 }
@@ -713,10 +1015,17 @@ static void download_error(const char *frame) {
 static int handle_file_frame(const char *frame) {
     if (strncmp(frame, "@FILE_ENTRY ", 12) == 0) {
         long long id, size;
-        char uploader[MAX_USER_LEN + 1];
         char b64[MAX_B64_NAME];
 
-        if (sscanf(frame + 12, "%lld %lld %10s %511s",
+        if (server_max_username > SIZE_MAX - 2) return 1;
+        char *uploader = malloc(server_max_username + 1);
+        if (uploader == NULL) return 1;
+
+        char uploader_fmt[64];
+        snprintf(uploader_fmt, sizeof(uploader_fmt),
+                 "%%lld %%lld %%%zus %%511s", server_max_username);
+
+        if (sscanf(frame + 12, uploader_fmt,
                    &id, &size, uploader, b64) == 4) {
             uint8_t decoded[256];
             size_t decoded_len = 0;
@@ -729,13 +1038,16 @@ static int handle_file_frame(const char *frame) {
                     remote_file_info *rf = &remote_files[remote_file_count++];
                     rf->id = id;
                     rf->size = size;
-                    snprintf(rf->uploader, sizeof(rf->uploader), "%s", uploader);
+                    free(rf->uploader);
+                    rf->uploader = uploader;
+                    uploader = NULL;
                     snprintf(rf->name, sizeof(rf->name), "%s",
                              (const char *)decoded);
                 }
                 pthread_mutex_unlock(&file_lock);
             }
         }
+        free(uploader);
         return 1;
     }
 
@@ -776,13 +1088,28 @@ static int handle_file_frame(const char *frame) {
     return 0;
 }
 
+/* Receive buffer large enough for any server frame, including usernames up to
+   the limit advertised by the server. */
+static size_t message_buffer_cap(void) {
+    size_t cap = BUFFER_SIZE + 128;
+    if (server_max_username <= SIZE_MAX - MAX_B64_NAME - 1024) {
+        size_t needed = server_max_username + MAX_B64_NAME + 1024;
+        if (needed > cap) cap = needed;
+    }
+    return cap;
+}
+
 void *receive_messages(void *socket_desc) {
     int sock = *(int*)socket_desc;
-    char buffer[BUFFER_SIZE];
+    size_t buffer_cap = message_buffer_cap();
+
+    char *buffer = malloc(buffer_cap);
+    if (buffer == NULL) return NULL;
+
     size_t bytes_received;
 
     while (is_running) {
-        int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
+        int rc = cchat_recv_encrypted(sock, buffer, buffer_cap - 1, &bytes_received);
         if (rc <= 0) {
             if (is_running) {
                 connection_lost = 1;
@@ -804,6 +1131,7 @@ void *receive_messages(void *socket_desc) {
             if (size >= 0) {
                 pthread_mutex_lock(&output_lock);
                 max_file_size = size;
+                if (!ui_active) redraw_chat_locked();
                 pthread_mutex_unlock(&output_lock);
             }
             continue;
@@ -818,6 +1146,7 @@ void *receive_messages(void *socket_desc) {
             if (ms == 0) {
                 cooldown_until_ms = 0;
             }
+            if (!ui_active) redraw_chat_locked();
             pthread_mutex_unlock(&output_lock);
             continue;
         }
@@ -861,11 +1190,20 @@ void *receive_messages(void *socket_desc) {
         output_text_locked(buffer, bytes_received);
         pthread_mutex_unlock(&output_lock);
     }
+    free(buffer);
     return NULL;
 }
 
 static void chat_loop(int sock) {
-    char formatted_msg[BUFFER_SIZE + MAX_USER_LEN + 10];
+    size_t username_len = strlen(current_username);
+    if (username_len > SIZE_MAX - BUFFER_SIZE - 10) return;
+    size_t formatted_cap = BUFFER_SIZE + username_len + 10;
+    char *formatted_msg = malloc(formatted_cap);
+    if (formatted_msg == NULL) {
+        notify("[!] Out of memory.");
+        return;
+    }
+
     int escape_state = 0;
     char escape_params[16];
     size_t escape_len = 0;
@@ -1076,7 +1414,7 @@ static void chat_loop(int sock) {
             memcpy(last_sent_message, message, message_len + 1);
             last_sent_len = message_len;
 
-            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n",
+            snprintf(formatted_msg, formatted_cap, "[%s]: %s\n",
                      current_username, message);
 
             input_line_len = 0;
@@ -1085,7 +1423,7 @@ static void chat_loop(int sock) {
             cooldown_until_ms = global_delay_ms > 0
                 ? monotonic_ms() + global_delay_ms
                 : 0;
-            output_text_locked(formatted_msg, strlen(formatted_msg));
+            draw_prompt_locked();
             pthread_mutex_unlock(&output_lock);
 
             if (client_send(sock, formatted_msg, strlen(formatted_msg)) <= 0) {
@@ -1111,6 +1449,7 @@ static void chat_loop(int sock) {
             }
         }
     }
+    free(formatted_msg);
 }
 
 static int get_home_dir(char *out, size_t size) {
@@ -1334,6 +1673,11 @@ static void send_file_path(int sock, const char *path) {
     pthread_mutex_lock(&output_lock);
     long long size_limit = max_file_size;
     pthread_mutex_unlock(&output_lock);
+
+    if (size_limit <= 0) {
+        notify("[!] File uploads are disabled on this server.");
+        return;
+    }
 
     if ((long long)st.st_size > size_limit) {
         char text[8192];
@@ -1581,6 +1925,10 @@ static void open_upload_manager(int sock) {
 
 static void request_file_list(int sock) {
     pthread_mutex_lock(&file_lock);
+    for (int i = 0; i < remote_file_count; i++) {
+        free(remote_files[i].uploader);
+        remote_files[i].uploader = NULL;
+    }
     remote_file_count = 0;
     file_list_ready = 0;
     pthread_mutex_unlock(&file_lock);
@@ -1624,7 +1972,8 @@ static void draw_download_ui(const char *saved_to, remote_file_info *files,
             printf("%s#%lld %.*s (%s) by %s\33[K",
                    selected[idx] ? "[x] " : "[ ] ",
                    files[idx].id, name_width, files[idx].name,
-                   size_text, files[idx].uploader);
+                   size_text,
+                   files[idx].uploader != NULL ? files[idx].uploader : "");
             if (idx == cursor) fputs("\33[0m", stdout);
             putchar('\n');
         }
@@ -1669,6 +2018,11 @@ static void open_download_browser(int sock) {
         calloc(count > 0 ? (size_t)count : 1, sizeof(*files));
     if (files != NULL && count > 0) {
         memcpy(files, remote_files, (size_t)count * sizeof(*files));
+        for (int i = 0; i < count; i++) {
+            files[i].uploader = remote_files[i].uploader != NULL
+                ? strdup(remote_files[i].uploader)
+                : strdup("");
+        }
     }
     pthread_mutex_unlock(&file_lock);
 
@@ -1738,6 +2092,9 @@ static void open_download_browser(int sock) {
     }
 
     free(selected);
+    for (int i = 0; i < count; i++) {
+        free(files[i].uploader);
+    }
     free(files);
 }
 
@@ -2083,7 +2440,9 @@ static int choose_server(char *ip, size_t ip_size, int *port,
 }
 
 static void load_history_into_buffer(int sock) {
-    char buffer[BUFFER_SIZE];
+    size_t buffer_cap = message_buffer_cap();
+    char *buffer = malloc(buffer_cap);
+    if (buffer == NULL) return;
     size_t bytes_received;
 
     struct timeval tv;
@@ -2092,7 +2451,7 @@ static void load_history_into_buffer(int sock) {
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 
     while (1) {
-        int rc = cchat_recv_encrypted(sock, buffer, sizeof(buffer) - 1, &bytes_received);
+        int rc = cchat_recv_encrypted(sock, buffer, buffer_cap - 1, &bytes_received);
         if (rc <= 0) break;
         buffer[bytes_received] = '\0';
 
@@ -2128,6 +2487,7 @@ static void load_history_into_buffer(int sock) {
     tv.tv_sec = 0;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    free(buffer);
 }
 
 int main(void) {
@@ -2183,6 +2543,31 @@ int main(void) {
         break;
     }
 
+    if (read_server_limits(sock) != 0) {
+        printf("Server does not support configurable account limits or did not respond.\n");
+        close(sock);
+        return 0;
+    }
+
+    if (server_max_username == SIZE_MAX ||
+        server_max_password == SIZE_MAX) {
+        printf("[Error]: Server limits are invalid.\n");
+        close(sock);
+        return 0;
+    }
+
+    current_username = calloc(1, server_max_username + 1);
+    char *password = calloc(1, server_max_password + 1);
+    char *confirmation = NULL;
+    char *auth_data = NULL;
+    int exit_code = 0;
+
+    if (current_username == NULL || password == NULL) {
+        printf("[Error]: Out of memory.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
     int choice = 0;
     while (choice != 1 && choice != 2) {
         printf("\n1. Sign In\n2. Sign Up\nChoose action (1 or 2): ");
@@ -2193,57 +2578,72 @@ int main(void) {
         while (getchar() != '\n');
     }
 
-    memset(current_username, 0, MAX_USER_LEN);
-    printf("Enter username (max 9 characters): ");
-    if (fgets(current_username, MAX_USER_LEN, stdin) != NULL) {
-        if (strchr(current_username, '\n') == NULL) {
-            int ch;
-            while ((ch = getchar()) != '\n' && ch != EOF) {
-            }
-        }
-        current_username[strcspn(current_username, "\r\n")] = 0;
+    if (!prompt_username(current_username, server_max_username + 1,
+                         server_max_username)) {
+        goto cleanup;
     }
 
-    char password[MAX_PASS_LEN];
-    memset(password, 0, MAX_PASS_LEN);
-    if (!read_password("Enter password (max 63 characters): ", password, sizeof(password))) {
-        close(sock);
-        return 0;
+    if (!read_server_password("Enter password", password,
+                              server_max_password + 1,
+                              server_max_password)) {
+        goto cleanup;
     }
 
     if (choice == 2) {
-        char confirmation[MAX_PASS_LEN];
+        confirmation = calloc(1, server_max_password + 1);
+        if (confirmation == NULL) {
+            printf("[Error]: Out of memory.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
 
         for (;;) {
-            memset(confirmation, 0, sizeof(confirmation));
-            if (!read_password("Confirm password: ", confirmation, sizeof(confirmation))) {
-                close(sock);
-                return 0;
+            memset(confirmation, 0, server_max_password + 1);
+            if (!read_server_password("Confirm password", confirmation,
+                                      server_max_password + 1,
+                                      server_max_password)) {
+                goto cleanup;
             }
 
             if (strcmp(password, confirmation) == 0) break;
 
             printf("[Error]: Passwords do not match. Try again.\n");
-            memset(password, 0, sizeof(password));
-            if (!read_password("Enter password (max 63 characters): ", password, sizeof(password))) {
-                close(sock);
-                return 0;
+            memset(password, 0, server_max_password + 1);
+            if (!read_server_password("Enter password", password,
+                                      server_max_password + 1,
+                                      server_max_password)) {
+                goto cleanup;
             }
         }
 
-        memset(confirmation, 0, sizeof(confirmation));
+        memset(confirmation, 0, server_max_password + 1);
     }
 
-    char auth_data[sizeof(int) + MAX_USER_LEN + MAX_PASS_LEN];
-    memset(auth_data, 0, sizeof(auth_data));
-    memcpy(auth_data, &choice, sizeof(int));
-    memcpy(auth_data + sizeof(int), current_username, MAX_USER_LEN);
-    memcpy(auth_data + sizeof(int) + MAX_USER_LEN, password, MAX_PASS_LEN);
+    size_t username_len = strlen(current_username);
+    size_t password_len = strlen(password);
+    if (username_len > SIZE_MAX - sizeof(int) - password_len - 2) {
+        printf("[Error]: Credentials are too long.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+    size_t auth_len = sizeof(int) + username_len + 1 + password_len + 1;
+    auth_data = calloc(1, auth_len);
+    if (auth_data == NULL) {
+        printf("[Error]: Out of memory.\n");
+        exit_code = 1;
+        goto cleanup;
+    }
 
-    if (client_send(sock, auth_data, sizeof(auth_data)) <= 0) {
+    memcpy(auth_data, &choice, sizeof(int));
+    memcpy(auth_data + sizeof(int), current_username, username_len);
+    auth_data[sizeof(int) + username_len] = '\0';
+    memcpy(auth_data + sizeof(int) + username_len + 1, password, password_len);
+    auth_data[sizeof(int) + username_len + 1 + password_len] = '\0';
+
+    if (client_send(sock, auth_data, auth_len) <= 0) {
         perror("Failed to send credentials");
-        close(sock);
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
     char response[64];
@@ -2251,8 +2651,7 @@ int main(void) {
     int auth_rc = cchat_recv_encrypted(sock, response, sizeof(response) - 1, &response_len);
     if (auth_rc <= 0) {
         printf("Server disconnected or did not respond.\n");
-        close(sock);
-        return 0;
+        goto cleanup;
     }
     response[response_len] = '\0';
 
@@ -2261,11 +2660,14 @@ int main(void) {
             printf("\n[Error]: User already exists.\n");
         } else if (strcmp(response, "ERR_BANNED") == 0) {
             printf("\n[Error]: You are permanently banned for spamming.\n");
+        } else if (strcmp(response, "ERR_USERNAME_TOO_LONG") == 0) {
+            printf("\n[Error]: Username is longer than the server allows.\n");
+        } else if (strcmp(response, "ERR_PASSWORD_TOO_LONG") == 0) {
+            printf("\n[Error]: Password is longer than the server allows.\n");
         } else {
             printf("\n[Error]: Invalid username or password.\n");
         }
-        close(sock);
-        return 0;
+        goto cleanup;
     }
 
     if (choice == 2) {
@@ -2285,8 +2687,8 @@ int main(void) {
     if (pthread_create(&recv_thread, NULL, receive_messages, (void*)&sock) < 0) {
         restore_terminal();
         perror("Failed to create thread");
-        close(sock);
-        return 1;
+        exit_code = 1;
+        goto cleanup;
     }
 
     pthread_t heartbeat_thread;
@@ -2310,6 +2712,15 @@ int main(void) {
         fflush(stdout);
     }
 
+cleanup:
+    free(auth_data);
+    free(confirmation);
+    if (password != NULL) {
+        memset(password, 0, server_max_password + 1);
+        free(password);
+    }
+    free(current_username);
+    current_username = NULL;
     close(sock);
-    return 0;
+    return exit_code;
 }

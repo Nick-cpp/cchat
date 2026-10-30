@@ -20,7 +20,17 @@ files and directories (such as `Downloads`) are ignored.
 
 ## Chat
 
-The chat fills the terminal and keeps the prompt on the bottom line.
+The chat fills the terminal and keeps the prompt on the bottom line.  The very
+bottom line is a status bar with the server's current message delay and upload
+limit.  When the server's upload limit is zero, the bar reports that file
+uploads are disabled.
+
+Every message is shown with the server's date and time, for example
+`[2026-10-29 14:05:12] [alice]: hello`.  The timestamp is added by the server
+when it receives the message, so all users see the same server time, and the
+time is also stored in the chat history.
+
+Long messages are wrapped to the terminal width instead of being cut off.
 
 * `Up` / `Down` scroll through the loaded history one line at a time.
 * `PageUp` / `PageDown` scroll a full page.
@@ -78,7 +88,21 @@ tb = 0
 
 The example above means 16 MiB.  For example, `mb = 16` and `kb = 512` gives
 16.5 MiB.  The server sends the resulting limit to clients automatically.
-Setting every unit to `0` disables non-empty uploads.
+Setting every unit to `0` disables uploads; the client shows this in its bottom
+status bar.
+
+`limits.conf` controls the maximum username and password length accepted by
+the server:
+
+```
+max_username = 10
+max_password = 64
+```
+
+The server sends these values to clients before login, so the username and
+password prompts follow the server configuration.  There are no fixed client
+or server caps: the limits in `limits.conf` are used exactly as written.  If
+the file does not exist, it is created with the defaults shown above.
 
 `history.conf` controls how many chat lines are kept (`0` = unlimited).  When
 a non-zero limit is used and a file announcement falls out of the history, the

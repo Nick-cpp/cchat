@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -371,13 +372,13 @@ static int cchat_encrypt(const void *plain, size_t plain_len,
                          uint8_t *out, size_t out_cap, size_t *out_len) {
     if (cchat_key_len == 0) return -1;
 
-    if (plain_len > CHAT_MAX_FRAME ||
-        out_cap < plain_len + CHAT_CRYPTO_OVERHEAD) {
+    if (out_cap < plain_len + CHAT_CRYPTO_OVERHEAD) {
         return -1;
     }
 
     uint8_t enc_key[32];
     uint8_t mac_key[32];
+    uint8_t mac[32];
     uint8_t *nonce = out;
     uint8_t *cipher = out + CHAT_CRYPTO_NONCE_LEN;
     uint8_t *tag = cipher + plain_len;
@@ -389,10 +390,12 @@ static int cchat_encrypt(const void *plain, size_t plain_len,
 
     cchat_chacha20_xor(enc_key, nonce, (const uint8_t *)plain, plain_len, cipher);
     cchat_hmac_sha256(mac_key, sizeof(mac_key), out,
-                      CHAT_CRYPTO_NONCE_LEN + plain_len, tag);
+                      CHAT_CRYPTO_NONCE_LEN + plain_len, mac);
+    memcpy(tag, mac, CHAT_CRYPTO_TAG_LEN);
 
     memset(enc_key, 0, sizeof(enc_key));
     memset(mac_key, 0, sizeof(mac_key));
+    memset(mac, 0, sizeof(mac));
 
     *out_len = plain_len + CHAT_CRYPTO_OVERHEAD;
     return 0;
@@ -550,27 +553,39 @@ static int cchat_recv_all(int fd, void *buf, size_t len) {
     return 1;
 }
 
-/* Sends one encrypted, length-prefixed message. */
+/* Sends one encrypted, length-prefixed message.  The packet is allocated on
+   the heap so account limits are not restricted by a fixed frame size. */
 static int cchat_send_encrypted(int fd, const void *data, size_t len) {
-    uint8_t packet[CHAT_CRYPTO_NONCE_LEN + CHAT_MAX_FRAME + CHAT_CRYPTO_TAG_LEN];
-    size_t packet_len;
+    if (len > UINT32_MAX - CHAT_CRYPTO_OVERHEAD) return -1;
 
-    if (cchat_encrypt(data, len, packet, sizeof(packet), &packet_len) != 0) {
-        return -1;
+    size_t packet_cap = len + CHAT_CRYPTO_OVERHEAD;
+    uint8_t *packet = malloc(packet_cap);
+    if (packet == NULL) return -1;
+
+    size_t packet_len = 0;
+    int result = -1;
+
+    if (cchat_encrypt(data, len, packet, packet_cap, &packet_len) == 0) {
+        uint32_t net_len = htonl((uint32_t)packet_len);
+        if (cchat_send_all(fd, &net_len, sizeof(net_len)) == 1 &&
+            cchat_send_all(fd, packet, packet_len) == 1) {
+            result = 1;
+        }
     }
 
-    uint32_t net_len = htonl((uint32_t)packet_len);
-    if (cchat_send_all(fd, &net_len, sizeof(net_len)) != 1) return -1;
-    if (cchat_send_all(fd, packet, packet_len) != 1) return -1;
-    return 1;
+    free(packet);
+    return result;
 }
+
+/* Upper bound used only to avoid unbounded allocations from a malicious peer.
+   It is a transport safety limit, not an account-policy limit. */
+#define CHAT_MAX_PACKET (64u * 1024u * 1024u)
 
 /*
  * Receives one encrypted, length-prefixed message.
  * Returns 1 on success, 0 when the peer closed the connection, -1 on error.
  */
 static int cchat_recv_encrypted(int fd, void *out, size_t out_cap, size_t *out_len) {
-    uint8_t packet[CHAT_CRYPTO_NONCE_LEN + CHAT_MAX_FRAME + CHAT_CRYPTO_TAG_LEN];
     uint32_t net_len;
 
     int rc = cchat_recv_all(fd, &net_len, sizeof(net_len));
@@ -578,17 +593,26 @@ static int cchat_recv_encrypted(int fd, void *out, size_t out_cap, size_t *out_l
 
     uint32_t packet_len = ntohl(net_len);
     if (packet_len < CHAT_CRYPTO_OVERHEAD ||
-        packet_len > sizeof(packet)) {
+        packet_len > CHAT_MAX_PACKET) {
         return -1;
     }
+
+    uint8_t *packet = malloc(packet_len);
+    if (packet == NULL) return -1;
 
     rc = cchat_recv_all(fd, packet, packet_len);
-    if (rc <= 0) return rc;
-
-    if (cchat_decrypt(packet, packet_len, out, out_cap, out_len) != 0) {
-        return -1;
+    if (rc <= 0) {
+        free(packet);
+        return rc;
     }
-    return 1;
+
+    int result = -1;
+    if (cchat_decrypt(packet, packet_len, out, out_cap, out_len) == 0) {
+        result = 1;
+    }
+
+    free(packet);
+    return result;
 }
 
 #endif /* CCHAT_CRYPTO_H */
