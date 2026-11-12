@@ -104,6 +104,10 @@ password prompts follow the server configuration.  There are no fixed client
 or server caps: the limits in `limits.conf` are used exactly as written.  If
 the file does not exist, it is created with the defaults shown above.
 
+Older servers that do not send the limits frame are still supported.  In that
+case the client falls back to the legacy fixed-size credential format, where
+usernames are limited to 9 characters and passwords to 63 characters.
+
 `history.conf` controls how many chat lines are kept (`0` = unlimited).  When
 a non-zero limit is used and a file announcement falls out of the history, the
 server also deletes that file from `files/` and removes it from `files.index`.

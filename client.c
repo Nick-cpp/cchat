@@ -21,6 +21,10 @@
 
 #define BUFFER_SIZE 4096
 #define MAX_MSG_LEN 512
+/* Older cchat servers did not send @LIMITS and used a fixed credential packet. */
+#define LEGACY_MAX_USER_LEN 10
+#define LEGACY_MAX_PASS_LEN 64
+#define LIMITS_WAIT_MS 3000
 #define MAX_KEY_PATH 4096
 #define MAX_CHAT_LINES 5000
 #define MAX_SAVED_SERVERS 256
@@ -280,8 +284,34 @@ static long long monotonic_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* The server sends the configurable account limits before authentication. */
+/* The server sends the configurable account limits before authentication.
+   Returns 0 for a modern server, 1 for a legacy server that does not send
+   @LIMITS (fixed 10/64-byte credential fields), and -1 on error. */
 static int read_server_limits(int sock) {
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock, &rfds);
+
+        struct timeval tv;
+        tv.tv_sec = LIMITS_WAIT_MS / 1000;
+        tv.tv_usec = (LIMITS_WAIT_MS % 1000) * 1000;
+
+        int ready = select(sock + 1, &rfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ready == 0) {
+            /* No limits frame: fall back to the old protocol instead of
+               refusing to talk to the server. */
+            server_max_username = LEGACY_MAX_USER_LEN - 1;
+            server_max_password = LEGACY_MAX_PASS_LEN - 1;
+            return 1;
+        }
+        break;
+    }
+
     char buffer[128];
     size_t len = 0;
 
@@ -292,7 +322,17 @@ static int read_server_limits(int sock) {
 
     unsigned long long user_limit = 0;
     unsigned long long pass_limit = 0;
-    if (sscanf(buffer, "@LIMITS %llu %llu", &user_limit, &pass_limit) != 2) {
+
+    if (strncmp(buffer, "@LIMITS", 7) != 0) {
+        return -1;
+    }
+
+    /* Accept spaces or punctuation between @LIMITS and the two numbers. */
+    const char *numbers = buffer + 7;
+    while (*numbers != '\0' && (*numbers < '0' || *numbers > '9')) {
+        numbers++;
+    }
+    if (sscanf(numbers, "%llu %llu", &user_limit, &pass_limit) != 2) {
         return -1;
     }
 
@@ -2543,10 +2583,17 @@ int main(void) {
         break;
     }
 
-    if (read_server_limits(sock) != 0) {
-        printf("Server does not support configurable account limits or did not respond.\n");
+    int limits_mode = read_server_limits(sock);
+    if (limits_mode < 0) {
+        printf("[Error]: Could not read the server's account limits. "
+               "Check the server key and that the server is running.\n");
         close(sock);
         return 0;
+    }
+    if (limits_mode == 1) {
+        printf("[!] Server uses the legacy protocol; username and password "
+               "are limited to %d and %d characters.\n",
+               LEGACY_MAX_USER_LEN - 1, LEGACY_MAX_PASS_LEN - 1);
     }
 
     if (server_max_username == SIZE_MAX ||
@@ -2560,6 +2607,7 @@ int main(void) {
     char *password = calloc(1, server_max_password + 1);
     char *confirmation = NULL;
     char *auth_data = NULL;
+    size_t auth_len = 0;
     int exit_code = 0;
 
     if (current_username == NULL || password == NULL) {
@@ -2621,24 +2669,53 @@ int main(void) {
 
     size_t username_len = strlen(current_username);
     size_t password_len = strlen(password);
-    if (username_len > SIZE_MAX - sizeof(int) - password_len - 2) {
-        printf("[Error]: Credentials are too long.\n");
-        exit_code = 1;
-        goto cleanup;
-    }
-    size_t auth_len = sizeof(int) + username_len + 1 + password_len + 1;
-    auth_data = calloc(1, auth_len);
-    if (auth_data == NULL) {
-        printf("[Error]: Out of memory.\n");
-        exit_code = 1;
-        goto cleanup;
-    }
 
-    memcpy(auth_data, &choice, sizeof(int));
-    memcpy(auth_data + sizeof(int), current_username, username_len);
-    auth_data[sizeof(int) + username_len] = '\0';
-    memcpy(auth_data + sizeof(int) + username_len + 1, password, password_len);
-    auth_data[sizeof(int) + username_len + 1 + password_len] = '\0';
+    if (limits_mode == 1) {
+        /* Legacy wire format: int + fixed 10-byte username + fixed
+           64-byte password, all zero padded. */
+        if (username_len >= LEGACY_MAX_USER_LEN ||
+            password_len >= LEGACY_MAX_PASS_LEN) {
+            printf("[Error]: This legacy server only accepts usernames up "
+                   "to %d and passwords up to %d characters.\n",
+                   LEGACY_MAX_USER_LEN - 1, LEGACY_MAX_PASS_LEN - 1);
+            exit_code = 1;
+            goto cleanup;
+        }
+
+        size_t legacy_len = sizeof(int) + LEGACY_MAX_USER_LEN +
+                            LEGACY_MAX_PASS_LEN;
+        auth_data = calloc(1, legacy_len);
+        if (auth_data == NULL) {
+            printf("[Error]: Out of memory.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+        memcpy(auth_data, &choice, sizeof(int));
+        memcpy(auth_data + sizeof(int), current_username, username_len);
+        memcpy(auth_data + sizeof(int) + LEGACY_MAX_USER_LEN,
+               password, password_len);
+        auth_len = legacy_len;
+    } else {
+        if (username_len > SIZE_MAX - sizeof(int) - password_len - 2) {
+            printf("[Error]: Credentials are too long.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+        auth_len = sizeof(int) + username_len + 1 + password_len + 1;
+        auth_data = calloc(1, auth_len);
+        if (auth_data == NULL) {
+            printf("[Error]: Out of memory.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+
+        memcpy(auth_data, &choice, sizeof(int));
+        memcpy(auth_data + sizeof(int), current_username, username_len);
+        auth_data[sizeof(int) + username_len] = '\0';
+        memcpy(auth_data + sizeof(int) + username_len + 1, password,
+               password_len);
+        auth_data[sizeof(int) + username_len + 1 + password_len] = '\0';
+    }
 
     if (client_send(sock, auth_data, auth_len) <= 0) {
         perror("Failed to send credentials");
